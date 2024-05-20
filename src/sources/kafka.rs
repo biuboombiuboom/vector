@@ -991,7 +991,7 @@ fn parse_stream<'a>(
 
     let payload = Cursor::new(Bytes::copy_from_slice(payload));
 
-    let mut stream = FramedRead::with_capacity(payload, decoder,msg.payload_len());
+    let mut stream = FramedRead::new(payload, decoder);
     let (count, _) = stream.size_hint();
     let stream = stream! {
         while let Some(result) = stream.next().await {
