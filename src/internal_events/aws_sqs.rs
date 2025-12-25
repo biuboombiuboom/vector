@@ -1,26 +1,74 @@
+#![allow(dead_code)] // TODO requires optional feature compilation
+
 use metrics::counter;
 #[cfg(feature = "sources-aws_s3")]
 pub use s3::*;
-use vector_lib::internal_event::InternalEvent;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs"))]
 use vector_lib::internal_event::{error_stage, error_type};
+use vector_lib::{NamedInternalEvent, internal_event::InternalEvent};
 
 #[cfg(feature = "sources-aws_s3")]
 mod s3 {
+    use std::time::Duration;
+
     use aws_sdk_sqs::types::{
         BatchResultErrorEntry, DeleteMessageBatchRequestEntry, DeleteMessageBatchResultEntry,
+        SendMessageBatchRequestEntry, SendMessageBatchResultEntry,
     };
+    use metrics::histogram;
 
     use super::*;
     use crate::sources::aws_s3::sqs::ProcessingError;
 
-    #[derive(Debug)]
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct S3ObjectProcessingSucceeded<'a> {
+        pub bucket: &'a str,
+        pub duration: Duration,
+    }
+
+    impl InternalEvent for S3ObjectProcessingSucceeded<'_> {
+        fn emit(self) {
+            debug!(
+                message = "S3 object processing succeeded.",
+                bucket = %self.bucket,
+                duration_ms = %self.duration.as_millis(),
+            );
+            histogram!(
+                "s3_object_processing_succeeded_duration_seconds",
+                "bucket" => self.bucket.to_owned(),
+            )
+            .record(self.duration);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct S3ObjectProcessingFailed<'a> {
+        pub bucket: &'a str,
+        pub duration: Duration,
+    }
+
+    impl InternalEvent for S3ObjectProcessingFailed<'_> {
+        fn emit(self) {
+            debug!(
+                message = "S3 object processing failed.",
+                bucket = %self.bucket,
+                duration_ms = %self.duration.as_millis(),
+            );
+            histogram!(
+                "s3_object_processing_failed_duration_seconds",
+                "bucket" => self.bucket.to_owned(),
+            )
+            .record(self.duration);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
     pub struct SqsMessageProcessingError<'a> {
         pub message_id: &'a str,
         pub error: &'a ProcessingError,
     }
 
-    impl<'a> InternalEvent for SqsMessageProcessingError<'a> {
+    impl InternalEvent for SqsMessageProcessingError<'_> {
         fn emit(self) {
             error!(
                 message = "Failed to process SQS message.",
@@ -29,18 +77,18 @@ mod s3 {
                 error_code = "failed_processing_sqs_message",
                 error_type = error_type::PARSER_FAILED,
                 stage = error_stage::PROCESSING,
-                internal_log_rate_limit = true,
             );
             counter!(
-                "component_errors_total", 1,
+                "component_errors_total",
                 "error_code" => "failed_processing_sqs_message",
                 "error_type" => error_type::PARSER_FAILED,
                 "stage" => error_stage::PROCESSING,
-            );
+            )
+            .increment(1);
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, NamedInternalEvent)]
     pub struct SqsMessageDeleteSucceeded {
         pub message_ids: Vec<DeleteMessageBatchResultEntry>,
     }
@@ -52,14 +100,11 @@ mod s3 {
                 .map(|x| x.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", "));
-            counter!(
-                "sqs_message_delete_succeeded_total",
-                self.message_ids.len() as u64
-            );
+            counter!("sqs_message_delete_succeeded_total").increment(self.message_ids.len() as u64);
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, NamedInternalEvent)]
     pub struct SqsMessageDeletePartialError {
         pub entries: Vec<BatchResultErrorEntry>,
     }
@@ -75,18 +120,18 @@ mod s3 {
                 error_code = "failed_deleting_some_sqs_messages",
                 error_type = error_type::ACKNOWLEDGMENT_FAILED,
                 stage = error_stage::PROCESSING,
-                internal_log_rate_limit = true,
             );
             counter!(
-                "component_errors_total", 1,
+                "component_errors_total",
                 "error_code" => "failed_deleting_some_sqs_messages",
                 "error_type" => error_type::ACKNOWLEDGMENT_FAILED,
                 "stage" => error_stage::PROCESSING,
-            );
+            )
+            .increment(1);
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, NamedInternalEvent)]
     pub struct SqsMessageDeleteBatchError<E> {
         pub entries: Vec<DeleteMessageBatchRequestEntry>,
         pub error: E,
@@ -104,24 +149,96 @@ mod s3 {
                 error_code = "failed_deleting_all_sqs_messages",
                 error_type = error_type::ACKNOWLEDGMENT_FAILED,
                 stage = error_stage::PROCESSING,
-                internal_log_rate_limit = true,
             );
             counter!(
-                "component_errors_total", 1,
+                "component_errors_total",
                 "error_code" => "failed_deleting_all_sqs_messages",
                 "error_type" => error_type::ACKNOWLEDGMENT_FAILED,
                 "stage" => error_stage::PROCESSING,
+            )
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct SqsMessageSentSucceeded {
+        pub message_ids: Vec<SendMessageBatchResultEntry>,
+    }
+
+    impl InternalEvent for SqsMessageSentSucceeded {
+        fn emit(self) {
+            trace!(message = "Deferred SQS message(s).",
+            message_ids = %self.message_ids.iter()
+                .map(|x| x.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "));
+            counter!("sqs_message_defer_succeeded_total").increment(self.message_ids.len() as u64);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct SqsMessageSentPartialError {
+        pub entries: Vec<BatchResultErrorEntry>,
+    }
+
+    impl InternalEvent for SqsMessageSentPartialError {
+        fn emit(self) {
+            error!(
+                message = "Sending of deferred SQS message(s) failed.",
+                message_ids = %self.entries.iter()
+                    .map(|x| format!("{}/{}", x.id, x.code))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                error_code = "failed_deferring_some_sqs_messages",
+                error_type = error_type::ACKNOWLEDGMENT_FAILED,
+                stage = error_stage::PROCESSING,
             );
+            counter!(
+                "component_errors_total",
+                "error_code" => "failed_deferring_some_sqs_messages",
+                "error_type" => error_type::ACKNOWLEDGMENT_FAILED,
+                "stage" => error_stage::PROCESSING,
+            )
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct SqsMessageSendBatchError<E> {
+        pub entries: Vec<SendMessageBatchRequestEntry>,
+        pub error: E,
+    }
+
+    impl<E: std::fmt::Display> InternalEvent for SqsMessageSendBatchError<E> {
+        fn emit(self) {
+            error!(
+                message = "Sending of deferred SQS message(s) failed.",
+                message_ids = %self.entries.iter()
+                    .map(|x| x.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                error = %self.error,
+                error_code = "failed_deferring_all_sqs_messages",
+                error_type = error_type::ACKNOWLEDGMENT_FAILED,
+                stage = error_stage::PROCESSING,
+            );
+            counter!(
+                "component_errors_total",
+                "error_code" => "failed_deferring_all_sqs_messages",
+                "error_type" => error_type::ACKNOWLEDGMENT_FAILED,
+                "stage" => error_stage::PROCESSING,
+            )
+            .increment(1);
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SqsMessageReceiveError<'a, E> {
     pub error: &'a E,
 }
 
-impl<'a, E: std::fmt::Display> InternalEvent for SqsMessageReceiveError<'a, E> {
+impl<E: std::fmt::Display> InternalEvent for SqsMessageReceiveError<'_, E> {
     fn emit(self) {
         error!(
             message = "Failed to fetch SQS events.",
@@ -129,18 +246,18 @@ impl<'a, E: std::fmt::Display> InternalEvent for SqsMessageReceiveError<'a, E> {
             error_code = "failed_fetching_sqs_events",
             error_type = error_type::REQUEST_FAILED,
             stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_code" => "failed_fetching_sqs_events",
             "error_type" => error_type::REQUEST_FAILED,
             "stage" => error_stage::RECEIVING,
-        );
+        )
+        .increment(1);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SqsMessageReceiveSucceeded {
     pub count: usize,
 }
@@ -148,52 +265,52 @@ pub struct SqsMessageReceiveSucceeded {
 impl InternalEvent for SqsMessageReceiveSucceeded {
     fn emit(self) {
         trace!(message = "Received SQS messages.", count = %self.count);
-        counter!("sqs_message_receive_succeeded_total", 1);
-        counter!("sqs_message_received_messages_total", self.count as u64);
+        counter!("sqs_message_receive_succeeded_total").increment(1);
+        counter!("sqs_message_received_messages_total").increment(self.count as u64);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SqsMessageProcessingSucceeded<'a> {
     pub message_id: &'a str,
 }
 
-impl<'a> InternalEvent for SqsMessageProcessingSucceeded<'a> {
+impl InternalEvent for SqsMessageProcessingSucceeded<'_> {
     fn emit(self) {
         trace!(message = "Processed SQS message successfully.", message_id = %self.message_id);
-        counter!("sqs_message_processing_succeeded_total", 1);
+        counter!("sqs_message_processing_succeeded_total").increment(1);
     }
 }
 
 // AWS SQS source
 
 #[cfg(feature = "sources-aws_sqs")]
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SqsMessageDeleteError<'a, E> {
     pub error: &'a E,
 }
 
 #[cfg(feature = "sources-aws_sqs")]
-impl<'a, E: std::fmt::Display> InternalEvent for SqsMessageDeleteError<'a, E> {
+impl<E: std::fmt::Display> InternalEvent for SqsMessageDeleteError<'_, E> {
     fn emit(self) {
         error!(
             message = "Failed to delete SQS events.",
             error = %self.error,
             error_type = error_type::WRITER_FAILED,
             stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_type" => error_type::WRITER_FAILED,
             "stage" => error_stage::PROCESSING,
-        );
+        )
+        .increment(1);
     }
 }
 
 // AWS s3 source
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SqsS3EventRecordInvalidEventIgnored<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
@@ -201,10 +318,11 @@ pub struct SqsS3EventRecordInvalidEventIgnored<'a> {
     pub name: &'a str,
 }
 
-impl<'a> InternalEvent for SqsS3EventRecordInvalidEventIgnored<'a> {
+impl InternalEvent for SqsS3EventRecordInvalidEventIgnored<'_> {
     fn emit(self) {
         warn!(message = "Ignored S3 record in SQS message for an event that was not ObjectCreated.",
             bucket = %self.bucket, key = %self.key, kind = %self.kind, name = %self.name);
-        counter!("sqs_s3_event_record_ignored_total", 1, "ignore_type" => "invalid_event_kind");
+        counter!("sqs_s3_event_record_ignored_total", "ignore_type" => "invalid_event_kind")
+            .increment(1);
     }
 }

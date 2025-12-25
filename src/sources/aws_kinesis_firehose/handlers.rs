@@ -1,34 +1,35 @@
 use std::io::Read;
 
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
 use chrono::Utc;
 use flate2::read::MultiGzDecoder;
 use futures::StreamExt;
 use snafu::{ResultExt, Snafu};
 use tokio_util::codec::FramedRead;
-use vector_lib::codecs::StreamDecodingError;
-use vector_lib::lookup::{metadata_path, path, PathPrefix};
+use vector_common::constants::GZIP_MAGIC;
 use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    codecs::StreamDecodingError,
     config::{LegacyKey, LogNamespace},
     event::BatchNotifier,
-    EstimatedJsonEncodedSizeOf,
-};
-use vector_lib::{
     finalization::AddBatchNotifier,
     internal_event::{
         ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Registered,
     },
+    lookup::{PathPrefix, metadata_path, path},
+    source_sender::SendError,
 };
 use vrl::compiler::SecretTarget;
 use warp::reject;
 
 use super::{
+    Compression,
     errors::{ParseRecordsSnafu, RequestError},
     models::{EncodedFirehoseRecord, FirehoseRequest, FirehoseResponse},
-    Compression,
 };
 use crate::{
+    SourceSender,
     codecs::Decoder,
     config::log_schema,
     event::{BatchStatus, Event},
@@ -36,7 +37,6 @@ use crate::{
         AwsKinesisFirehoseAutomaticRecordDecodeError, EventsReceived, StreamClosedError,
     },
     sources::aws_kinesis_firehose::AwsKinesisFirehoseConfig,
-    SourceSender,
 };
 
 #[derive(Clone)]
@@ -77,20 +77,21 @@ pub(super) async fn firehose(
                         events.estimated_json_encoded_size_of(),
                     ));
 
-                    let (batch, receiver) = context
-                        .acknowledgements
-                        .then(|| {
+                    let (batch, receiver) = if context.acknowledgements {
+                        {
                             let (batch, receiver) = BatchNotifier::new_with_receiver();
                             (Some(batch), Some(receiver))
-                        })
-                        .unwrap_or((None, None));
+                        }
+                    } else {
+                        (None, None)
+                    };
 
                     let now = Utc::now();
                     for event in &mut events {
                         if let Some(batch) = &batch {
                             event.add_batch_notifier(batch.clone());
                         }
-                        if let Event::Log(ref mut log) = event {
+                        if let Event::Log(log) = event {
                             log_namespace.insert_vector_metadata(
                                 log,
                                 log_schema().source_type_key(),
@@ -132,25 +133,27 @@ pub(super) async fn firehose(
                                 source_arn.to_owned(),
                             );
 
-                            if context.store_access_key {
-                                if let Some(access_key) = &request.access_key {
-                                    log.metadata_mut().secrets_mut().insert_secret(
-                                        "aws_kinesis_firehose_access_key",
-                                        access_key,
-                                    );
-                                }
+                            if context.store_access_key
+                                && let Some(access_key) = &request.access_key
+                            {
+                                log.metadata_mut()
+                                    .secrets_mut()
+                                    .insert_secret("aws_kinesis_firehose_access_key", access_key);
                             }
                         }
                     }
 
                     let count = events.len();
-                    if let Err(error) = context.out.send_batch(events).await {
-                        emit!(StreamClosedError { count });
-                        let error = RequestError::ShuttingDown {
-                            request_id: request_id.clone(),
-                            source: error,
-                        };
-                        warp::reject::custom(error);
+                    match context.out.send_batch(events).await {
+                        Ok(()) => (),
+                        Err(SendError::Closed) => {
+                            emit!(StreamClosedError { count });
+                            let error = RequestError::ShuttingDown {
+                                request_id: request_id.clone(),
+                            };
+                            warp::reject::custom(error);
+                        }
+                        Err(SendError::Timeout) => unreachable!("No timeout is configured here"),
                     }
 
                     drop(batch);
@@ -219,22 +222,30 @@ fn decode_record(
             compression: compression.to_owned(),
         }),
         Compression::Auto => {
-            match infer::get(&buf) {
-                Some(filetype) => match filetype.mime_type() {
-                    "application/gzip" => decode_gzip(&buf[..]).or_else(|error| {
-                        emit!(AwsKinesisFirehoseAutomaticRecordDecodeError {
-                            compression: Compression::Gzip,
-                            error
-                        });
-                        Ok(Bytes::from(buf))
-                    }),
-                    // only support gzip for now
-                    _ => Ok(Bytes::from(buf)),
-                },
-                None => Ok(Bytes::from(buf)),
+            if is_gzip(&buf) {
+                decode_gzip(&buf[..]).or_else(|error| {
+                    emit!(AwsKinesisFirehoseAutomaticRecordDecodeError {
+                        compression: Compression::Gzip,
+                        error
+                    });
+                    Ok(Bytes::from(buf))
+                })
+            } else {
+                // only support gzip for now
+                Ok(Bytes::from(buf))
             }
         }
     }
+}
+
+fn is_gzip(data: &[u8]) -> bool {
+    // The header length of a GZIP file is 10 bytes. The first two bytes of the constant comes from
+    // the GZIP file format specification, which is the fixed member header identification bytes.
+    // The third byte is the compression method, of which only one is defined which is 8 for the
+    // deflate algorithm.
+    //
+    // Reference: https://datatracker.ietf.org/doc/html/rfc1952 Section 2.3
+    data.starts_with(GZIP_MAGIC)
 }
 
 fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
@@ -244,4 +255,24 @@ fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
     gz.read_to_end(&mut decoded)?;
 
     Ok(Bytes::from(decoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use flate2::{Compression, write::GzEncoder};
+
+    use super::*;
+
+    const CONTENT: &[u8] = b"Example";
+
+    #[test]
+    fn correctly_detects_gzipped_content() {
+        assert!(!is_gzip(CONTENT));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(CONTENT).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(is_gzip(&compressed));
+    }
 }

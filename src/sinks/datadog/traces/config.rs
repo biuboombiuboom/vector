@@ -3,32 +3,34 @@ use std::sync::{Arc, Mutex};
 use http::Uri;
 use indoc::indoc;
 use snafu::ResultExt;
-use tokio::sync::oneshot::{channel, Sender};
+use tokio::sync::oneshot::{Sender, channel};
 use tower::ServiceBuilder;
-use vector_lib::config::{proxy::ProxyConfig, AcknowledgementsConfig};
-use vector_lib::configurable::configurable_component;
+use vector_lib::{
+    config::{AcknowledgementsConfig, proxy::ProxyConfig},
+    configurable::configurable_component,
+};
 
 use super::{
-    apm_stats::{flush_apm_stats_thread, Aggregator},
+    apm_stats::{Aggregator, flush_apm_stats_thread},
     service::TraceApiRetry,
 };
-use crate::common::datadog;
 use crate::{
+    common::datadog,
     config::{GenerateConfig, Input, SinkConfig, SinkContext},
     http::HttpClient,
     sinks::{
+        Healthcheck, UriParseSnafu, VectorSink,
         datadog::{
+            DatadogCommonConfig, LocalDatadogCommonConfig,
             traces::{
                 request_builder::DatadogTracesRequestBuilder, service::TraceApiService,
                 sink::TracesSink,
             },
-            DatadogCommonConfig, LocalDatadogCommonConfig,
         },
         util::{
-            service::ServiceBuilderExt, BatchConfig, Compression, SinkBatchSettings,
-            TowerRequestConfig,
+            BatchConfig, Compression, SinkBatchSettings, TowerRequestConfig,
+            service::ServiceBuilderExt,
         },
-        Healthcheck, UriParseSnafu, VectorSink,
     },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
@@ -188,13 +190,16 @@ impl DatadogTracesConfig {
     }
 
     pub fn build_client(&self, proxy: &ProxyConfig) -> crate::Result<HttpClient> {
+        let default_tls_config;
+
         let tls_settings = MaybeTlsSettings::from_config(
-            &Some(
-                self.local_dd_common
-                    .tls
-                    .clone()
-                    .unwrap_or_else(TlsEnableableConfig::enabled),
-            ),
+            Some(match self.local_dd_common.tls.as_ref() {
+                Some(config) => config,
+                None => {
+                    default_tls_config = TlsEnableableConfig::enabled();
+                    &default_tls_config
+                }
+            }),
             false,
         )?;
         Ok(HttpClient::new(tls_settings, proxy)?)
@@ -232,7 +237,7 @@ impl SinkConfig for DatadogTracesConfig {
 }
 
 fn build_uri(host: &str, endpoint: &str) -> crate::Result<Uri> {
-    let result = format!("{}{}", host, endpoint)
+    let result = format!("{host}{endpoint}")
         .parse::<Uri>()
         .context(UriParseSnafu)?;
     Ok(result)

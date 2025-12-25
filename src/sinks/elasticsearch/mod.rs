@@ -1,11 +1,11 @@
 mod common;
 mod config;
-mod encoder;
-mod health;
-mod request_builder;
-mod retry;
-mod service;
-mod sink;
+pub mod encoder;
+pub mod health;
+pub mod request_builder;
+pub mod retry;
+pub mod service;
+pub mod sink;
 
 #[cfg(test)]
 mod tests;
@@ -19,10 +19,12 @@ use std::{convert::TryFrom, fmt};
 pub use common::*;
 pub use config::*;
 pub use encoder::ElasticsearchEncoder;
-use http::{uri::InvalidUri, Request};
+use http::{Request, uri::InvalidUri};
 use snafu::Snafu;
-use vector_lib::sensitive_string::SensitiveString;
-use vector_lib::{configurable::configurable_component, internal_event};
+use vector_lib::{
+    NamedInternalEvent, configurable::configurable_component, internal_event::InternalEvent,
+    sensitive_string::SensitiveString,
+};
 
 use crate::{
     event::{EventRef, LogEvent},
@@ -34,7 +36,9 @@ use crate::{
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "strategy")]
-#[configurable(metadata(docs::enum_tag_description = "The authentication strategy to use."))]
+#[configurable(metadata(
+    docs::enum_tag_description = "The authentication strategy to use.\n\nAmazon OpenSearch Serverless requires this option to be set to `aws`."
+))]
 pub enum ElasticsearchAuthConfig {
     /// HTTP Basic Authentication.
     Basic {
@@ -58,21 +62,20 @@ pub enum ElasticsearchAuthConfig {
 #[configurable_component]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ElasticsearchMode {
     /// Ingests documents in bulk, using the bulk API `index` action.
     #[serde(alias = "normal")]
+    #[default]
     Bulk,
 
     /// Ingests documents in bulk, using the bulk API `create` action.
     ///
     /// Elasticsearch Data Streams only support the `create` action.
+    ///
+    /// If the mode is set to `data_stream` and a `timestamp` field is present in a message,
+    /// Vector renames this field to the expected `@timestamp` to comply with the Elastic Common Schema.
     DataStream,
-}
-
-impl Default for ElasticsearchMode {
-    fn default() -> Self {
-        Self::Bulk
-    }
 }
 
 /// Bulk API actions.
@@ -85,6 +88,9 @@ pub enum BulkAction {
 
     /// The `create` action.
     Create,
+
+    /// The `update` action.
+    Update,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -93,6 +99,7 @@ impl BulkAction {
         match self {
             BulkAction::Index => "index",
             BulkAction::Create => "create",
+            BulkAction::Update => "update",
         }
     }
 
@@ -100,6 +107,7 @@ impl BulkAction {
         match self {
             BulkAction::Index => "/index",
             BulkAction::Create => "/create",
+            BulkAction::Update => "/update",
         }
     }
 }
@@ -111,7 +119,8 @@ impl TryFrom<&str> for BulkAction {
         match input {
             "index" => Ok(BulkAction::Index),
             "create" => Ok(BulkAction::Create),
-            _ => Err(format!("Invalid bulk action: {}", input)),
+            "update" => Ok(BulkAction::Update),
+            _ => Err(format!("Invalid bulk action: {input}")),
         }
     }
 }
@@ -150,7 +159,7 @@ impl TryFrom<&str> for VersionType {
             "internal" => Ok(VersionType::Internal),
             "external" | "external_gt" => Ok(VersionType::External),
             "external_gte" => Ok(VersionType::ExternalGte),
-            _ => Err(format!("Invalid versioning mode: {}", input)),
+            _ => Err(format!("Invalid versioning mode: {input}")),
         }
     }
 }
@@ -161,6 +170,7 @@ impl_generate_config_from_default!(ElasticsearchConfig);
 pub enum ElasticsearchCommonMode {
     Bulk {
         index: Template,
+        template_fallback_index: Option<String>,
         action: Template,
         version: Option<Template>,
         version_type: VersionType,
@@ -168,11 +178,12 @@ pub enum ElasticsearchCommonMode {
     DataStream(DataStreamConfig),
 }
 
+#[derive(NamedInternalEvent)]
 struct VersionValueParseError<'a> {
     value: &'a str,
 }
 
-impl internal_event::InternalEvent for VersionValueParseError<'_> {
+impl InternalEvent for VersionValueParseError<'_> {
     fn emit(self) {
         warn!("{self}")
     }
@@ -187,14 +198,28 @@ impl fmt::Display for VersionValueParseError<'_> {
 impl ElasticsearchCommonMode {
     fn index(&self, log: &LogEvent) -> Option<String> {
         match self {
-            Self::Bulk { index, .. } => index
+            Self::Bulk {
+                index,
+                template_fallback_index,
+                ..
+            } => index
                 .render_string(log)
-                .map_err(|error| {
-                    emit!(TemplateRenderingError {
-                        error,
-                        field: Some("index"),
-                        drop_event: true,
-                    });
+                .or_else(|error| {
+                    if let Some(fallback) = template_fallback_index {
+                        emit!(TemplateRenderingError {
+                            error,
+                            field: Some("index"),
+                            drop_event: false,
+                        });
+                        Ok(fallback.clone())
+                    } else {
+                        emit!(TemplateRenderingError {
+                            error,
+                            field: Some("index"),
+                            drop_event: true,
+                        });
+                        Err(())
+                    }
                 })
                 .ok(),
             Self::DataStream(ds) => ds.index(log),
@@ -266,7 +291,9 @@ impl ElasticsearchCommonMode {
 /// Configuration for Elasticsearch API version.
 #[configurable_component]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ElasticsearchApiVersion {
     /// Auto-detect the API version.
     ///
@@ -277,6 +304,7 @@ pub enum ElasticsearchApiVersion {
     /// incorrect API calls.
     ///
     /// [es_version]: https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-state.html#cluster-state-api-path-params
+    #[default]
     Auto,
     /// Use the Elasticsearch 6.x API.
     V6,
@@ -284,12 +312,6 @@ pub enum ElasticsearchApiVersion {
     V7,
     /// Use the Elasticsearch 8.x API.
     V8,
-}
-
-impl Default for ElasticsearchApiVersion {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Snafu)]
@@ -318,4 +340,8 @@ pub enum ParseError {
     ExternalVersioningWithoutDocumentID,
     #[snafu(display("Your version field will be ignored because you use internal versioning"))]
     ExternalVersionIgnoredWithInternalVersioning,
+    #[snafu(display("Amazon OpenSearch Serverless requires `api_version` value to be `auto`"))]
+    ServerlessElasticsearchApiVersionMustBeAuto,
+    #[snafu(display("Amazon OpenSearch Serverless requires `auth.strategy` value to be `aws`"))]
+    OpenSearchServerlessRequiresAwsAuth,
 }

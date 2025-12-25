@@ -1,20 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
-use aws_sdk_secretsmanager::{config, Client};
-use futures::executor;
+use aws_sdk_secretsmanager::{Client, config};
 use vector_lib::configurable::{component::GenerateConfig, configurable_component};
 
-use crate::aws::{create_client, AwsAuthentication, ClientBuilder, RegionOrEndpoint};
-use crate::config::ProxyConfig;
-use crate::tls::TlsConfig;
-use crate::{config::SecretBackend, signal};
+use crate::{
+    aws::{AwsAuthentication, ClientBuilder, RegionOrEndpoint, create_client},
+    config::{ProxyConfig, SecretBackend},
+    signal,
+    tls::TlsConfig,
+};
 
 pub(crate) struct SecretsManagerClientBuilder;
 
 impl ClientBuilder for SecretsManagerClientBuilder {
     type Client = Client;
 
-    fn build(config: &aws_types::SdkConfig) -> Self::Client {
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
         let config = config::Builder::from(config).build();
         Client::from_conf(config)
     }
@@ -52,29 +53,27 @@ impl GenerateConfig for AwsSecretsManagerBackend {
 }
 
 impl SecretBackend for AwsSecretsManagerBackend {
-    fn retrieve(
+    async fn retrieve(
         &mut self,
         secret_keys: HashSet<String>,
         _: &mut signal::SignalRx,
     ) -> crate::Result<HashMap<String, String>> {
-        let client = executor::block_on(async {
-            create_client::<SecretsManagerClientBuilder>(
-                &self.auth,
-                self.region.region(),
-                self.region.endpoint(),
-                &ProxyConfig::default(),
-                &self.tls,
-            )
-            .await
-        })?;
+        let client = create_client::<SecretsManagerClientBuilder>(
+            &SecretsManagerClientBuilder {},
+            &self.auth,
+            self.region.region(),
+            self.region.endpoint(),
+            &ProxyConfig::default(),
+            self.tls.as_ref(),
+            None,
+        )
+        .await?;
 
-        let get_secret_value_response = executor::block_on(async {
-            client
-                .get_secret_value()
-                .secret_id(&self.secret_id)
-                .send()
-                .await
-        })?;
+        let get_secret_value_response = client
+            .get_secret_value()
+            .secret_id(&self.secret_id)
+            .send()
+            .await?;
 
         let secret_string = get_secret_value_response
             .secret_string

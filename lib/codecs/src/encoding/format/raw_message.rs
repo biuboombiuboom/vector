@@ -1,8 +1,9 @@
-use crate::encoding::format::common::get_serializer_schema_requirement;
 use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::Encoder;
 use vector_core::{config::DataType, event::Event, schema};
+
+use crate::encoding::format::common::get_serializer_schema_requirement;
 
 /// Config used to build a `RawMessageSerializer`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -33,13 +34,6 @@ impl RawMessageSerializerConfig {
 /// Serializer that converts an `Event` to bytes by extracting the message key.
 #[derive(Debug, Clone)]
 pub struct RawMessageSerializer;
-
-impl RawMessageSerializer {
-    /// Creates a new `RawMessageSerializer`.
-    pub const fn new() -> Self {
-        Self
-    }
-}
 
 impl Encoder<Event> for RawMessageSerializer {
     type Error = vector_common::Error;

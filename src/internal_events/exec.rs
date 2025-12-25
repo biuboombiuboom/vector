@@ -2,15 +2,17 @@ use std::time::Duration;
 
 use metrics::{counter, histogram};
 use tokio::time::error::Elapsed;
-use vector_lib::internal_event::InternalEvent;
 use vector_lib::{
-    internal_event::{error_stage, error_type, ComponentEventsDropped, UNINTENTIONAL},
+    NamedInternalEvent,
+    internal_event::{
+        ComponentEventsDropped, InternalEvent, UNINTENTIONAL, error_stage, error_type,
+    },
     json_size::JsonSize,
 };
 
 use super::prelude::io_error_code;
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ExecEventsReceived<'a> {
     pub count: usize,
     pub command: &'a str,
@@ -26,17 +28,19 @@ impl InternalEvent for ExecEventsReceived<'_> {
             command = %self.command,
         );
         counter!(
-            "component_received_events_total", self.count as u64,
+            "component_received_events_total",
             "command" => self.command.to_owned(),
-        );
+        )
+        .increment(self.count as u64);
         counter!(
-            "component_received_event_bytes_total", self.byte_size.get() as u64,
+            "component_received_event_bytes_total",
             "command" => self.command.to_owned(),
-        );
+        )
+        .increment(self.byte_size.get() as u64);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ExecFailedError<'a> {
     pub command: &'a str,
     pub error: std::io::Error,
@@ -51,19 +55,19 @@ impl InternalEvent for ExecFailedError<'_> {
             error_type = error_type::COMMAND_FAILED,
             error_code = %io_error_code(&self.error),
             stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "command" => self.command.to_owned(),
             "error_type" => error_type::COMMAND_FAILED,
             "error_code" => io_error_code(&self.error),
             "stage" => error_stage::RECEIVING,
-        );
+        )
+        .increment(1);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ExecTimeoutError<'a> {
     pub command: &'a str,
     pub elapsed_seconds: u64,
@@ -79,18 +83,18 @@ impl InternalEvent for ExecTimeoutError<'_> {
             error = %self.error,
             error_type = error_type::TIMED_OUT,
             stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "command" => self.command.to_owned(),
             "error_type" => error_type::TIMED_OUT,
             "stage" => error_stage::RECEIVING,
-        );
+        )
+        .increment(1);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ExecCommandExecuted<'a> {
     pub command: &'a str,
     pub exit_status: Option<i32>,
@@ -114,19 +118,20 @@ impl InternalEvent for ExecCommandExecuted<'_> {
             command = %self.command,
             exit_status = %exit_status,
             elapsed_millis = %self.exec_duration.as_millis(),
-            internal_log_rate_limit = true,
         );
         counter!(
-            "command_executed_total", 1,
+            "command_executed_total",
             "command" => self.command.to_owned(),
             "exit_status" => exit_status.clone(),
-        );
+        )
+        .increment(1);
 
         histogram!(
-            "command_execution_duration_seconds", self.exec_duration,
-            "command" => self.command.to_owned(),
+            "command_execution_duration_seconds",
             "exit_status" => exit_status,
-        );
+            "command" => self.command.to_owned(),
+        )
+        .record(self.exec_duration);
     }
 }
 
@@ -147,7 +152,7 @@ impl ExecFailedToSignalChild {
 
         match self {
             #[cfg(unix)]
-            SignalError(err) => format!("errno_{}", err),
+            SignalError(err) => format!("errno_{err}"),
             #[cfg(unix)]
             FailedToMarshalPid(_) => String::from("failed_to_marshal_pid"),
             #[cfg(unix)]
@@ -164,9 +169,9 @@ impl std::fmt::Display for ExecFailedToSignalChild {
 
         match self {
             #[cfg(unix)]
-            SignalError(err) => write!(f, "errno: {}", err),
+            SignalError(err) => write!(f, "errno: {err}"),
             #[cfg(unix)]
-            FailedToMarshalPid(err) => write!(f, "failed to marshal pid to i32: {}", err),
+            FailedToMarshalPid(err) => write!(f, "failed to marshal pid to i32: {err}"),
             #[cfg(unix)]
             NoPid => write!(f, "child had no pid"),
             #[cfg(windows)]
@@ -175,6 +180,7 @@ impl std::fmt::Display for ExecFailedToSignalChild {
     }
 }
 
+#[derive(NamedInternalEvent)]
 pub struct ExecFailedToSignalChildError<'a> {
     pub command: &'a tokio::process::Command,
     pub error: ExecFailedToSignalChild,
@@ -188,18 +194,19 @@ impl InternalEvent for ExecFailedToSignalChildError<'_> {
             error_code = %self.error.to_error_code(),
             error_type = error_type::COMMAND_FAILED,
             stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "command" => format!("{:?}", self.command.as_std()),
             "error_code" => self.error.to_error_code(),
             "error_type" => error_type::COMMAND_FAILED,
             "stage" => error_stage::RECEIVING,
-        );
+        )
+        .increment(1);
     }
 }
 
+#[derive(NamedInternalEvent)]
 pub struct ExecChannelClosedError;
 
 impl InternalEvent for ExecChannelClosedError {
@@ -209,13 +216,13 @@ impl InternalEvent for ExecChannelClosedError {
             message = exec_reason,
             error_type = error_type::COMMAND_FAILED,
             stage = error_stage::RECEIVING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_type" => error_type::COMMAND_FAILED,
             "stage" => error_stage::RECEIVING,
-        );
+        )
+        .increment(1);
         emit!(ComponentEventsDropped::<UNINTENTIONAL> {
             count: 1,
             reason: exec_reason

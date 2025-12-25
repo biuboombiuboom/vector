@@ -4,15 +4,18 @@
 //!
 //! [maxmind]: https://dev.maxmind.com/geoip/geoip2/downloadable
 //! [geolite]: https://dev.maxmind.com/geoip/geoip2/geolite2/#Download_Access
-use std::{collections::BTreeMap, fs, net::IpAddr, sync::Arc, time::SystemTime};
+use std::{fs, net::IpAddr, path::PathBuf, sync::Arc, time::SystemTime};
 
 use maxminddb::{
-    geoip2::{City, ConnectionType, Isp},
-    MaxMindDBError, Reader,
+    Reader,
+    geoip2::{AnonymousIp, City, ConnectionType, Isp, Names},
 };
 use ordered_float::NotNan;
-use vector_lib::configurable::configurable_component;
-use vector_lib::enrichment::{Case, Condition, IndexHandle, Table};
+use serde::Deserialize;
+use vector_lib::{
+    configurable::configurable_component,
+    enrichment::{Case, Condition, IndexHandle, Table},
+};
 use vrl::value::{ObjectMap, Value};
 
 use crate::config::{EnrichmentTableConfig, GenerateConfig};
@@ -26,6 +29,7 @@ pub enum DatabaseKind {
     Isp,
     ConnectionType,
     City,
+    AnonymousIp,
 }
 
 impl TryFrom<&str> for DatabaseKind {
@@ -37,6 +41,7 @@ impl TryFrom<&str> for DatabaseKind {
             "GeoIP2-ISP" => Ok(Self::Isp),
             "GeoIP2-Connection-Type" => Ok(Self::ConnectionType),
             "GeoIP2-City" | "GeoLite2-City" => Ok(Self::City),
+            "GeoIP2-Anonymous-IP" => Ok(Self::AnonymousIp),
             _ => Err(()),
         }
     }
@@ -54,7 +59,7 @@ pub struct GeoipConfig {
     ///
     /// [geoip2]: https://dev.maxmind.com/geoip/geoip2/downloadable
     /// [geolite2]: https://dev.maxmind.com/geoip/geoip2/geolite2/#Download_Access
-    pub path: String,
+    pub path: PathBuf,
 
     /// The locale to use when querying the database.
     ///
@@ -85,7 +90,7 @@ fn default_locale() -> String {
 impl GenerateConfig for GeoipConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            path: "/path/to/GeoLite2-City.mmdb".to_string(),
+            path: "/path/to/GeoLite2-City.mmdb".into(),
             locale: default_locale(),
         })
         .unwrap()
@@ -110,10 +115,18 @@ pub struct Geoip {
     last_modified: SystemTime,
 }
 
+fn lookup_value<'de, A: Deserialize<'de>>(
+    dbreader: &'de Reader<Vec<u8>>,
+    address: IpAddr,
+) -> crate::Result<Option<A>> {
+    let result = dbreader.lookup(address)?;
+    Ok(result.decode::<A>()?)
+}
+
 impl Geoip {
     /// Creates a new GeoIP struct from the provided config.
     pub fn new(config: GeoipConfig) -> crate::Result<Self> {
-        let dbreader = Arc::new(Reader::open_readfile(config.path.clone())?);
+        let dbreader = Arc::new(Reader::open_readfile(&config.path)?);
         let dbkind =
             DatabaseKind::try_from(dbreader.metadata.database_type.as_str()).map_err(|_| {
                 format!(
@@ -124,21 +137,22 @@ impl Geoip {
 
         // Check if we can read database with dummy Ip.
         let ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-        let result = match dbkind {
-            DatabaseKind::Asn | DatabaseKind::Isp => dbreader.lookup::<Isp>(ip).map(|_| ()),
-            DatabaseKind::ConnectionType => dbreader.lookup::<ConnectionType>(ip).map(|_| ()),
-            DatabaseKind::City => dbreader.lookup::<City>(ip).map(|_| ()),
-        };
+        match dbkind {
+            // Isp
+            DatabaseKind::Asn | DatabaseKind::Isp => lookup_value::<Isp>(&dbreader, ip).map(|_| ()),
+            DatabaseKind::ConnectionType => {
+                lookup_value::<ConnectionType>(&dbreader, ip).map(|_| ())
+            }
+            DatabaseKind::City => lookup_value::<City>(&dbreader, ip).map(|_| ()),
+            DatabaseKind::AnonymousIp => lookup_value::<AnonymousIp>(&dbreader, ip).map(|_| ()),
+        }?;
 
-        match result {
-            Ok(_) | Err(MaxMindDBError::AddressNotFoundError(_)) => Ok(Geoip {
-                last_modified: fs::metadata(&config.path)?.modified()?,
-                dbreader,
-                dbkind,
-                config,
-            }),
-            Err(error) => Err(error.into()),
-        }
+        Ok(Geoip {
+            last_modified: fs::metadata(&config.path)?.modified()?,
+            dbreader,
+            dbkind,
+            config,
+        })
     }
 
     fn lookup(&self, ip: IpAddr, select: Option<&[String]>) -> Option<ObjectMap> {
@@ -153,14 +167,14 @@ impl Geoip {
         };
 
         macro_rules! add_field {
-            ($k:expr, $v:expr) => {
+            ($k:expr_2021, $v:expr_2021) => {
                 add_field($k, $v.map(Into::into))
             };
         }
 
         match self.dbkind {
             DatabaseKind::Asn | DatabaseKind::Isp => {
-                let data = self.dbreader.lookup::<Isp>(ip).ok()?;
+                let data = lookup_value::<Isp>(&self.dbreader, ip).ok()??;
 
                 add_field!("autonomous_system_number", data.autonomous_system_number);
                 add_field!(
@@ -171,72 +185,77 @@ impl Geoip {
                 add_field!("organization", data.organization);
             }
             DatabaseKind::City => {
-                let data = self.dbreader.lookup::<City>(ip).ok()?;
+                let data: City = lookup_value::<City>(&self.dbreader, ip).ok()??;
 
-                add_field!(
-                    "city_name",
-                    self.take_translation(data.city.as_ref().and_then(|c| c.names.as_ref()))
-                );
+                add_field!("city_name", self.take_translation(&data.city.names));
 
-                add_field!("continent_code", data.continent.and_then(|c| c.code));
+                add_field!("continent_code", data.continent.code);
 
-                let country = data.country.as_ref();
-                add_field!("country_code", country.and_then(|country| country.iso_code));
-                add_field!(
-                    "country_name",
-                    self.take_translation(country.and_then(|c| c.names.as_ref()))
-                );
+                let country = data.country;
+                add_field!("country_code", country.iso_code);
+                add_field!("country_name", self.take_translation(&country.names));
 
-                let location = data.location.as_ref();
-                add_field!("timezone", location.and_then(|location| location.time_zone));
+                let location = data.location;
+                add_field!("timezone", location.time_zone);
                 add_field!(
                     "latitude",
-                    location
-                        .and_then(|location| location.latitude)
-                        .map(|latitude| Value::Float(
-                            NotNan::new(latitude).expect("latitude cannot be Nan")
-                        ))
+                    location.latitude.map(|latitude| Value::Float(
+                        NotNan::new(latitude).expect("latitude cannot be Nan")
+                    ))
                 );
                 add_field!(
                     "longitude",
                     location
-                        .and_then(|location| location.longitude)
+                        .longitude
                         .map(|longitude| NotNan::new(longitude).expect("longitude cannot be Nan"))
                 );
-                add_field!(
-                    "metro_code",
-                    location.and_then(|location| location.metro_code)
-                );
+                add_field!("metro_code", location.metro_code);
 
                 // last subdivision is most specific per https://github.com/maxmind/GeoIP2-java/blob/39385c6ce645374039450f57208b886cf87ade47/src/main/java/com/maxmind/geoip2/model/AbstractCityResponse.java#L96-L107
-                let subdivision = data.subdivisions.as_ref().and_then(|s| s.last());
+                let subdivision = data.subdivisions.last();
                 add_field!(
                     "region_name",
-                    self.take_translation(subdivision.and_then(|s| s.names.as_ref()))
+                    subdivision.map(|s| self.take_translation(&s.names))
                 );
+
                 add_field!(
                     "region_code",
                     subdivision.and_then(|subdivision| subdivision.iso_code)
                 );
-                add_field!("postal_code", data.postal.and_then(|p| p.code));
+                add_field!("postal_code", data.postal.code);
             }
             DatabaseKind::ConnectionType => {
-                let data = self.dbreader.lookup::<ConnectionType>(ip).ok()?;
+                let data = lookup_value::<ConnectionType>(&self.dbreader, ip).ok()??;
 
                 add_field!("connection_type", data.connection_type);
+            }
+            DatabaseKind::AnonymousIp => {
+                let data = lookup_value::<AnonymousIp>(&self.dbreader, ip).ok()??;
+
+                add_field!("is_anonymous", data.is_anonymous);
+                add_field!("is_anonymous_vpn", data.is_anonymous_vpn);
+                add_field!("is_hosting_provider", data.is_hosting_provider);
+                add_field!("is_public_proxy", data.is_public_proxy);
+                add_field!("is_residential_proxy", data.is_residential_proxy);
+                add_field!("is_tor_exit_node", data.is_tor_exit_node);
             }
         }
 
         Some(map)
     }
 
-    fn take_translation<'a>(
-        &self,
-        translations: Option<&BTreeMap<&str, &'a str>>,
-    ) -> Option<&'a str> {
-        translations
-            .and_then(|translations| translations.get(&*self.config.locale))
-            .copied()
+    fn take_translation<'a>(&self, translations: &'a Names<'a>) -> Option<&'a str> {
+        match self.config.locale.as_ref() {
+            "en" => translations.english,
+            "de" => translations.german,
+            "es" => translations.spanish,
+            "fr" => translations.french,
+            "ja" => translations.japanese,
+            "pt-BR" => translations.brazilian_portuguese,
+            "ru" => translations.russian,
+            "zh-CN" => translations.simplified_chinese,
+            _ => None,
+        }
     }
 }
 
@@ -251,9 +270,10 @@ impl Table for Geoip {
         case: Case,
         condition: &'a [Condition<'a>],
         select: Option<&[String]>,
+        wildcard: Option<&Value>,
         index: Option<IndexHandle>,
     ) -> Result<ObjectMap, String> {
-        let mut rows = self.find_table_rows(case, condition, select, index)?;
+        let mut rows = self.find_table_rows(case, condition, select, wildcard, index)?;
 
         match rows.pop() {
             Some(row) if rows.is_empty() => Ok(row),
@@ -270,6 +290,7 @@ impl Table for Geoip {
         _: Case,
         condition: &'a [Condition<'a>],
         select: Option<&[String]>,
+        _wildcard: Option<&Value>,
         _: Option<IndexHandle>,
     ) -> Result<Vec<ObjectMap>, String> {
         match condition.first() {
@@ -320,7 +341,8 @@ impl std::fmt::Debug for Geoip {
         write!(
             f,
             "Geoip {} database {})",
-            self.config.locale, self.config.path
+            self.config.locale,
+            self.config.path.display()
         )
     }
 }
@@ -455,11 +477,32 @@ mod tests {
     #[test]
     fn custom_mmdb_type_error() {
         let result = Geoip::new(GeoipConfig {
-            path: "tests/data/custom-type.mmdb".to_string(),
+            path: "tests/data/custom-type.mmdb".into(),
             locale: default_locale(),
         });
 
         assert!(result.is_err());
+    }
+    #[test]
+    fn anonymous_ip_lookup() {
+        let values = find("101.99.92.179", "tests/data/GeoIP2-Anonymous-IP-Test.mmdb").unwrap();
+
+        let mut expected = ObjectMap::new();
+        expected.insert("is_anonymous".into(), true.into());
+        expected.insert("is_anonymous_vpn".into(), true.into());
+        expected.insert("is_hosting_provider".into(), true.into());
+        expected.insert("is_tor_exit_node".into(), true.into());
+        expected.insert("is_public_proxy".into(), Value::Null);
+        expected.insert("is_residential_proxy".into(), Value::Null);
+
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn anonymous_ip_lookup_no_results() {
+        let values = find("10.1.12.1", "tests/data/GeoIP2-Anonymous-IP-Test.mmdb");
+
+        assert!(values.is_none());
     }
 
     fn find(ip: &str, database: &str) -> Option<ObjectMap> {
@@ -468,7 +511,7 @@ mod tests {
 
     fn find_select(ip: &str, database: &str, select: Option<&[String]>) -> Option<ObjectMap> {
         Geoip::new(GeoipConfig {
-            path: database.to_string(),
+            path: database.into(),
             locale: default_locale(),
         })
         .unwrap()
@@ -479,6 +522,7 @@ mod tests {
                 value: ip.into(),
             }],
             select,
+            None,
             None,
         )
         .unwrap()

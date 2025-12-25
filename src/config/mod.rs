@@ -2,6 +2,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display, Formatter},
+    fs,
     hash::Hash,
     net::SocketAddr,
     path::PathBuf,
@@ -10,29 +11,32 @@ use std::{
 
 use indexmap::IndexMap;
 use serde::Serialize;
-pub use vector_lib::config::{
-    AcknowledgementsConfig, DataType, GlobalOptions, Input, LogNamespace,
-    SourceAcknowledgementsConfig, SourceOutput, TransformOutput,
+use vector_config::configurable_component;
+pub use vector_lib::{
+    config::{
+        AcknowledgementsConfig, DataType, GlobalOptions, Input, LogNamespace,
+        SourceAcknowledgementsConfig, SourceOutput, TransformOutput, WildcardMatching,
+    },
+    configurable::component::{GenerateConfig, SinkDescription, TransformDescription},
 };
-pub use vector_lib::configurable::component::{
-    GenerateConfig, SinkDescription, TransformDescription,
-};
-use vector_lib::configurable::configurable_component;
 
-use crate::{conditions, event::Metric, secrets::SecretBackends, serde::OneOrMany};
+use crate::{
+    conditions,
+    event::{Metric, Value},
+    secrets::SecretBackends,
+    serde::OneOrMany,
+};
 
 pub mod api;
 mod builder;
 mod cmd;
 mod compiler;
 mod diff;
+pub mod dot_graph;
 mod enrichment_table;
-#[cfg(feature = "enterprise")]
-pub mod enterprise;
 pub mod format;
 mod graph;
-mod id;
-mod loading;
+pub mod loading;
 pub mod provider;
 pub mod schema;
 mod secret;
@@ -45,38 +49,75 @@ mod vars;
 pub mod watcher;
 
 pub use builder::ConfigBuilder;
-pub use cmd::{cmd, Opts};
+pub use cmd::{Opts, cmd};
 pub use diff::ConfigDiff;
 pub use enrichment_table::{EnrichmentTableConfig, EnrichmentTableOuter};
 pub use format::{Format, FormatHint};
-pub use id::{ComponentKey, Inputs};
 pub use loading::{
-    load, load_builder_from_paths, load_from_paths, load_from_paths_with_provider_and_secrets,
-    load_from_str, load_source_from_paths, merge_path_lists, process_paths, COLLECTOR,
-    CONFIG_PATHS,
+    COLLECTOR, CONFIG_PATHS, load, load_from_paths, load_from_paths_with_provider_and_secrets,
+    load_from_str, load_from_str_with_secrets, load_source_from_paths, merge_path_lists,
+    process_paths,
 };
 pub use provider::ProviderConfig;
 pub use secret::SecretBackend;
 pub use sink::{BoxedSink, SinkConfig, SinkContext, SinkHealthcheckOptions, SinkOuter};
 pub use source::{BoxedSource, SourceConfig, SourceContext, SourceOuter};
 pub use transform::{
-    get_transform_output_ids, BoxedTransform, TransformConfig, TransformContext, TransformOuter,
+    BoxedTransform, TransformConfig, TransformContext, TransformOuter, get_transform_output_ids,
 };
-pub use unit_test::{build_unit_tests, build_unit_tests_main, UnitTestResult};
+pub use unit_test::{UnitTestResult, build_unit_tests, build_unit_tests_main};
 pub use validation::warnings;
-pub use vars::{interpolate, ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX};
-pub use vector_lib::config::{
-    init_telemetry, log_schema, proxy::ProxyConfig, telemetry, LogSchema, OutputId,
+pub use vars::{ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX, interpolate};
+pub use vector_lib::{
+    config::{
+        ComponentKey, LogSchema, OutputId, init_log_schema, init_telemetry, log_schema,
+        proxy::ProxyConfig, telemetry,
+    },
+    id::Inputs,
 };
 
-/// Loads Log Schema from configurations and sets global schema.
-/// Once this is done, configurations can be correctly loaded using
-/// configured log schema defaults.
-/// If deny is set, will panic if schema has already been set.
-pub fn init_log_schema(config_paths: &[ConfigPath], deny_if_set: bool) -> Result<(), Vec<String>> {
-    let builder = load_builder_from_paths(config_paths)?;
-    vector_lib::config::init_log_schema(builder.global.log_schema, deny_if_set);
-    Ok(())
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+// // This is not a comprehensive set; variants are added as needed.
+pub enum ComponentType {
+    Transform,
+    Sink,
+    EnrichmentTable,
+}
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub struct ComponentConfig {
+    pub config_paths: Vec<PathBuf>,
+    pub component_key: ComponentKey,
+    pub component_type: ComponentType,
+}
+
+impl ComponentConfig {
+    pub fn new(
+        config_paths: Vec<PathBuf>,
+        component_key: ComponentKey,
+        component_type: ComponentType,
+    ) -> Self {
+        let canonicalized_paths = config_paths
+            .into_iter()
+            .filter_map(|p| fs::canonicalize(p).ok())
+            .collect();
+
+        Self {
+            config_paths: canonicalized_paths,
+            component_key,
+            component_type,
+        }
+    }
+
+    pub fn contains(
+        &self,
+        config_paths: &HashSet<PathBuf>,
+    ) -> Option<(ComponentKey, ComponentType)> {
+        if config_paths.iter().any(|p| self.config_paths.contains(p)) {
+            return Some((self.component_key.clone(), self.component_type.clone()));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -108,15 +149,12 @@ pub struct Config {
     #[cfg(feature = "api")]
     pub api: api::Options,
     pub schema: schema::Options,
-    pub hash: Option<String>,
-    #[cfg(feature = "enterprise")]
-    pub enterprise: Option<enterprise::Options>,
     pub global: GlobalOptions,
     pub healthchecks: HealthcheckOptions,
     sources: IndexMap<ComponentKey, SourceOuter>,
     sinks: IndexMap<ComponentKey, SinkOuter<OutputId>>,
     transforms: IndexMap<ComponentKey, TransformOuter<OutputId>>,
-    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter>,
+    pub enrichment_tables: IndexMap<ComponentKey, EnrichmentTableOuter<OutputId>>,
     tests: Vec<TestDefinition>,
     secret: IndexMap<ComponentKey, SecretBackends>,
     pub graceful_shutdown_duration: Option<Duration>,
@@ -155,11 +193,22 @@ impl Config {
         self.sinks.get(id)
     }
 
+    pub fn enrichment_tables(
+        &self,
+    ) -> impl Iterator<Item = (&ComponentKey, &EnrichmentTableOuter<OutputId>)> {
+        self.enrichment_tables.iter()
+    }
+
+    pub fn enrichment_table(&self, id: &ComponentKey) -> Option<&EnrichmentTableOuter<OutputId>> {
+        self.enrichment_tables.get(id)
+    }
+
     pub fn inputs_for_node(&self, id: &ComponentKey) -> Option<&[OutputId]> {
         self.transforms
             .get(id)
             .map(|t| &t.inputs[..])
             .or_else(|| self.sinks.get(id).map(|s| &s.inputs[..]))
+            .or_else(|| self.enrichment_tables.get(id).map(|s| &s.inputs[..]))
     }
 
     pub fn propagate_acknowledgements(&mut self) -> Result<(), Vec<String>> {
@@ -205,10 +254,23 @@ impl Config {
             }
         }
     }
+
+    pub fn transform_keys_with_external_files(&self) -> HashSet<ComponentKey> {
+        self.transforms
+            .iter()
+            .filter_map(|(name, transform_outer)| {
+                if !transform_outer.inner.files_to_watch().is_empty() {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// Healthcheck options.
-#[configurable_component]
+#[configurable_component(global_option("healthchecks"))]
 #[derive(Clone, Copy, Debug)]
 #[serde(default)]
 pub struct HealthcheckOptions {
@@ -232,7 +294,7 @@ impl HealthcheckOptions {
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    const fn merge(&mut self, other: Self) {
         self.enabled &= other.enabled;
         self.require_healthy |= other.require_healthy;
     }
@@ -246,6 +308,8 @@ impl Default for HealthcheckOptions {
         }
     }
 }
+
+impl_generate_config_from_default!(HealthcheckOptions);
 
 /// Unique thing, like port, of which only one owner can be.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -281,10 +345,10 @@ impl Resource {
         // Find equality based conflicts
         for (key, resources) in components {
             for resource in resources {
-                if let Resource::Port(address, protocol) = &resource {
-                    if address.ip().is_unspecified() {
-                        unspecified.push((key.clone(), *address, *protocol));
-                    }
+                if let Resource::Port(address, protocol) = &resource
+                    && address.ip().is_unspecified()
+                {
+                    unspecified.push((key.clone(), *address, *protocol));
                 }
 
                 resource_map
@@ -328,10 +392,10 @@ impl Display for Protocol {
 impl Display for Resource {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
-            Resource::Port(address, protocol) => write!(fmt, "{} {}", protocol, address),
+            Resource::Port(address, protocol) => write!(fmt, "{protocol} {address}"),
             Resource::SystemFdOffset(offset) => write!(fmt, "systemd {}th socket", offset + 1),
-            Resource::Fd(fd) => write!(fmt, "file descriptor: {}", fd),
-            Resource::DiskBuffer(name) => write!(fmt, "disk buffer {:?}", name),
+            Resource::Fd(fd) => write!(fmt, "file descriptor: {fd}"),
+            Resource::DiskBuffer(name) => write!(fmt, "disk buffer {name:?}"),
         }
     }
 }
@@ -389,12 +453,15 @@ impl TestDefinition<String> {
             .filter_map(|(extract_from, conditions)| {
                 let mut outputs = Vec::new();
                 for from in extract_from {
-                    if let Some(output_id) = output_map.get(&from) {
+                    if no_outputs_from.contains(&from) {
+                        errors.push(format!(
+                            r#"Invalid extract_from target in test '{name}': '{from}' listed in no_outputs_from"#
+                        ));
+                    } else if let Some(output_id) = output_map.get(&from) {
                         outputs.push(output_id.clone());
                     } else {
                         errors.push(format!(
-                            r#"Invalid extract_from target in test '{}': '{}' does not exist"#,
-                            name, from
+                            r#"Invalid extract_from target in test '{name}': '{from}' does not exist"#
                         ));
                     }
                 }
@@ -416,8 +483,7 @@ impl TestDefinition<String> {
                     Some(output_id.clone())
                 } else {
                     errors.push(format!(
-                        r#"Invalid no_outputs_from target in test '{}': '{}' does not exist"#,
-                        name, o
+                        r#"Invalid no_outputs_from target in test '{name}': '{o}' does not exist"#
                     ));
                     None
                 }
@@ -474,24 +540,6 @@ impl TestDefinition<OutputId> {
     }
 }
 
-/// Value for a log field.
-#[configurable_component]
-#[derive(Clone, Debug)]
-#[serde(untagged)]
-pub enum TestInputValue {
-    /// A string.
-    String(String),
-
-    /// An integer.
-    Integer(i64),
-
-    /// A floating-point number.
-    Float(f64),
-
-    /// A boolean.
-    Boolean(bool),
-}
-
 /// A unit test input.
 ///
 /// An input describes not only the type of event to insert, but also which transform within the
@@ -523,7 +571,7 @@ pub struct TestInput {
     /// The set of log fields to use when creating a log input event.
     ///
     /// Only relevant when `type` is `log`.
-    pub log_fields: Option<IndexMap<String, TestInputValue>>,
+    pub log_fields: Option<IndexMap<String, Value>>,
 
     /// The metric to use as an input event.
     ///
@@ -552,12 +600,12 @@ pub struct TestOutput<T: 'static = OutputId> {
 
 #[cfg(all(test, feature = "sources-file", feature = "sinks-console"))]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::path::PathBuf;
 
-    use crate::{config, topology};
     use indoc::indoc;
 
-    use super::{builder::ConfigBuilder, format, load_from_str, ComponentKey, ConfigDiff, Format};
+    use super::{ComponentKey, ConfigDiff, Format, builder::ConfigBuilder, format, load_from_str};
+    use crate::{config, topology::builder::TopologyPiecesBuilder};
 
     async fn load(config: &str, format: config::Format) -> Result<Vec<String>, Vec<String>> {
         match config::load_from_str(config, format) {
@@ -566,8 +614,7 @@ mod tests {
                 let c2 = config::load_from_str(config, format).unwrap();
                 match (
                     config::warnings(&c2),
-                    topology::TopologyPieces::build(&c, &diff, HashMap::new(), Default::default())
-                        .await,
+                    TopologyPiecesBuilder::new(&c, &diff).build().await,
                 ) {
                     (warnings, Ok(_pieces)) => Ok(warnings),
                     (_, Err(errors)) => Err(errors),
@@ -699,22 +746,27 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "sources-file_descriptor"))]
     async fn no_conflict_fd_resources() {
+        use crate::sources::file_descriptors::file_descriptor::null_fd;
+        let fd1 = null_fd().unwrap();
+        let fd2 = null_fd().unwrap();
         let result = load(
-            r#"
+            &format!(
+                r#"
             [sources.file_descriptor1]
             type = "file_descriptor"
-            fd = 10
+            fd = {fd1}
 
             [sources.file_descriptor2]
             type = "file_descriptor"
-            fd = 20
+            fd = {fd2}
 
             [sinks.out]
             type = "test_basic"
             inputs = ["file_descriptor1", "file_descriptor2"]
-            "#,
+            "#
+            ),
             Format::Toml,
         )
         .await;
@@ -1100,128 +1152,6 @@ mod tests {
         assert_eq!(source.proxy.https, None);
         assert!(source.proxy.no_proxy.matches("localhost"));
     }
-
-    #[test]
-    #[cfg(feature = "enterprise")]
-    fn order_independent_sha256_hashes() {
-        let config1: ConfigBuilder = format::deserialize(
-            indoc! {r#"
-                data_dir = "/tmp"
-
-                [api]
-                    enabled = true
-
-                [sources.file]
-                    type = "file"
-                    ignore_older_secs = 600
-                    include = ["/var/log/**/*.log"]
-                    read_from = "beginning"
-
-                [sources.internal_metrics]
-                    type = "internal_metrics"
-                    namespace = "pipelines"
-
-                [transforms.filter]
-                    type = "filter"
-                    inputs = ["internal_metrics"]
-                    condition = """
-                        .name == "component_received_bytes_total"
-                    """
-
-                [sinks.out]
-                    type = "console"
-                    inputs = ["filter"]
-                    target = "stdout"
-                    encoding.codec = "json"
-            "#},
-            Format::Toml,
-        )
-        .unwrap();
-
-        let config2: ConfigBuilder = format::deserialize(
-            indoc! {r#"
-                data_dir = "/tmp"
-
-                [sources.internal_metrics]
-                    type = "internal_metrics"
-                    namespace = "pipelines"
-
-                [sources.file]
-                    type = "file"
-                    ignore_older_secs = 600
-                    include = ["/var/log/**/*.log"]
-                    read_from = "beginning"
-
-                [transforms.filter]
-                    type = "filter"
-                    inputs = ["internal_metrics"]
-                    condition = """
-                        .name == "component_received_bytes_total"
-                    """
-
-                [sinks.out]
-                    type = "console"
-                    inputs = ["filter"]
-                    target = "stdout"
-                    encoding.codec = "json"
-
-                [api]
-                    enabled = true
-            "#},
-            Format::Toml,
-        )
-        .unwrap();
-
-        assert_eq!(config1.sha256_hash(), config2.sha256_hash())
-    }
-
-    #[test]
-    #[cfg(feature = "enterprise")]
-    fn enterprise_tags_ignored_sha256_hashes() {
-        let config1: ConfigBuilder = format::deserialize(
-            indoc! {r#"
-                [enterprise]
-                api_key = "api_key"
-                configuration_key = "configuration_key"
-
-                [enterprise.tags]
-                tag = "value"
-
-                [sources.internal_metrics]
-                type = "internal_metrics"
-
-                [sinks.datadog_metrics]
-                type = "datadog_metrics"
-                inputs = ["*"]
-                default_api_key = "default_api_key"
-            "#},
-            Format::Toml,
-        )
-        .unwrap();
-
-        let config2: ConfigBuilder = format::deserialize(
-            indoc! {r#"
-                [enterprise]
-                api_key = "api_key"
-                configuration_key = "configuration_key"
-
-                [enterprise.tags]
-                another_tag = "another value"
-
-                [sources.internal_metrics]
-                type = "internal_metrics"
-
-                [sinks.datadog_metrics]
-                type = "datadog_metrics"
-                inputs = ["*"]
-                default_api_key = "default_api_key"
-            "#},
-            Format::Toml,
-        )
-        .unwrap();
-
-        assert_eq!(config1.sha256_hash(), config2.sha256_hash())
-    }
 }
 
 #[cfg(all(test, feature = "sources-file", feature = "sinks-file"))]
@@ -1424,12 +1354,13 @@ mod resource_config_tests {
     use indoc::indoc;
     use vector_lib::configurable::schema::generate_root_schema;
 
-    use super::{load_from_str, Format};
+    use super::{Format, load_from_str};
 
     #[test]
     fn config_conflict_detected() {
-        assert!(load_from_str(
-            indoc! {r#"
+        assert!(
+            load_from_str(
+                indoc! {r#"
                 [sources.in0]
                   type = "stdin"
 
@@ -1441,9 +1372,10 @@ mod resource_config_tests {
                   inputs = ["in0","in1"]
                   encoding.codec = "json"
             "#},
-            Format::Toml,
-        )
-        .is_err());
+                Format::Toml,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1451,10 +1383,10 @@ mod resource_config_tests {
     #[allow(clippy::print_stdout)]
     #[allow(clippy::print_stderr)]
     fn generate_component_config_schema() {
-        use crate::config::{SinkOuter, SourceOuter, TransformOuter};
         use indexmap::IndexMap;
-        use vector_lib::config::ComponentKey;
-        use vector_lib::configurable::configurable_component;
+        use vector_lib::{config::ComponentKey, configurable::configurable_component};
+
+        use crate::config::{SinkOuter, SourceOuter, TransformOuter};
 
         /// Top-level Vector configuration.
         #[configurable_component]
@@ -1478,9 +1410,9 @@ mod resource_config_tests {
                 let json = serde_json::to_string_pretty(&schema)
                     .expect("rendering root schema to JSON should not fail");
 
-                println!("{}", json);
+                println!("{json}");
             }
-            Err(e) => eprintln!("error while generating schema: {:?}", e),
+            Err(e) => eprintln!("error while generating schema: {e:?}"),
         }
     }
 }

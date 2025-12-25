@@ -19,7 +19,7 @@ pub struct SnappyEncoder<W: io::Write> {
 }
 
 impl<W: io::Write> SnappyEncoder<W> {
-    pub fn new(writer: W) -> Self {
+    pub const fn new(writer: W) -> Self {
         Self {
             writer,
             buffer: Vec::new(),
@@ -39,7 +39,7 @@ impl<W: io::Write> SnappyEncoder<W> {
         &self.writer
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 }

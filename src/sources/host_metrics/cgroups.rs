@@ -1,4 +1,9 @@
-use std::{io, num::ParseIntError, path::Path, path::PathBuf, str::FromStr};
+use std::{
+    io,
+    num::ParseIntError,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use futures::future::BoxFuture;
 use snafu::{ResultExt, Snafu};
@@ -8,7 +13,7 @@ use tokio::{
 };
 use vector_lib::metric_tags;
 
-use super::{filter_result_sync, CGroupsConfig, HostMetrics, MetricsBuffer};
+use super::{CGroupsConfig, HostMetrics, MetricsBuffer, filter_result_sync};
 use crate::event::MetricTags;
 
 const MICROSECONDS: f64 = 1.0 / 1_000_000.0;
@@ -177,6 +182,26 @@ impl<'a> CGroupRecurser<'a> {
                 .gauge("cgroup_memory_anon_bytes", stat.anon as f64, tags.clone());
             self.output
                 .gauge("cgroup_memory_file_bytes", stat.file as f64, tags.clone());
+            self.output.gauge(
+                "cgroup_memory_anon_active_bytes",
+                stat.active_anon as f64,
+                tags.clone(),
+            );
+            self.output.gauge(
+                "cgroup_memory_anon_inactive_bytes",
+                stat.inactive_anon as f64,
+                tags.clone(),
+            );
+            self.output.gauge(
+                "cgroup_memory_file_active_bytes",
+                stat.active_file as f64,
+                tags.clone(),
+            );
+            self.output.gauge(
+                "cgroup_memory_file_inactive_bytes",
+                stat.inactive_file as f64,
+                tags.clone(),
+            );
         }
     }
 }
@@ -389,14 +414,18 @@ define_stat_struct! { MemoryStat(
     // for more details.
     anon,
     file,
+    active_anon,
+    inactive_anon,
+    active_file,
+    inactive_file,
 )}
 
 fn is_dir(path: impl AsRef<Path>) -> bool {
-    std::fs::metadata(path.as_ref()).map_or(false, |metadata| metadata.is_dir())
+    std::fs::metadata(path.as_ref()).is_ok_and(|metadata| metadata.is_dir())
 }
 
 fn is_file(path: impl AsRef<Path>) -> bool {
-    std::fs::metadata(path.as_ref()).map_or(false, |metadata| metadata.is_file())
+    std::fs::metadata(path.as_ref()).is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Join a base directory path with a cgroup name.
@@ -426,22 +455,24 @@ fn join_name(base_name: &Path, filename: impl AsRef<Path>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::fs::{self, File};
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeSet,
+        fs::{self, File},
+        io::Write,
+        path::{Path, PathBuf},
+    };
 
-    use rand::{rngs::ThreadRng, Rng};
+    use rand::{Rng, rngs::ThreadRng};
     use similar_asserts::assert_eq;
     use tempfile::TempDir;
     use vector_lib::event::Metric;
 
     use super::{
         super::{
-            tests::{count_name, count_tag},
             HostMetrics, HostMetricsConfig,
+            tests::{count_name, count_tag},
         },
-        join_name, join_path, MetricsBuffer,
+        MetricsBuffer, join_name, join_path,
     };
 
     #[test]
@@ -469,6 +500,10 @@ mod tests {
         assert_ne!(count_name(&metrics, "cgroup_cpu_system_seconds_total"), 0);
         assert_ne!(count_name(&metrics, "cgroup_memory_anon_bytes"), 0);
         assert_ne!(count_name(&metrics, "cgroup_memory_file_bytes"), 0);
+        assert_ne!(count_name(&metrics, "cgroup_memory_anon_active_bytes"), 0);
+        assert_ne!(count_name(&metrics, "cgroup_memory_anon_inactive_bytes"), 0);
+        assert_ne!(count_name(&metrics, "cgroup_memory_file_active_bytes"), 0);
+        assert_ne!(count_name(&metrics, "cgroup_memory_file_inactive_bytes"), 0);
     }
 
     #[tokio::test]
@@ -501,8 +536,8 @@ mod tests {
         base.d("memory");
         base.d("unified");
         for subdir in SUBDIRS {
-            base.group(&format!("unified/{}", subdir), CPU_STAT, Some(""));
-            base.group(&format!("memory/{}", subdir), MEMORY_STAT, None);
+            base.group(&format!("unified/{subdir}"), CPU_STAT, Some(""));
+            base.group(&format!("memory/{subdir}"), MEMORY_STAT, None);
         }
         base.test().await;
     }
@@ -520,11 +555,11 @@ mod tests {
         base.d("unified");
         for subdir in SUBDIRS {
             base.group(
-                &format!("unified/{}", subdir),
+                &format!("unified/{subdir}"),
                 if subdir == "." { NONE } else { CPU_STAT },
                 Some(""),
             );
-            base.group(&format!("memory/{}", subdir), MEMORY_STAT, None);
+            base.group(&format!("memory/{subdir}"), MEMORY_STAT, None);
         }
         base.test().await;
     }
@@ -537,8 +572,8 @@ mod tests {
         base.d("cpu");
         base.d("memory");
         for subdir in SUBDIRS {
-            base.group(&format!("cpu/{}", subdir), CPU_STAT, None);
-            base.group(&format!("memory/{}", subdir), MEMORY_STAT, None);
+            base.group(&format!("cpu/{subdir}"), CPU_STAT, None);
+            base.group(&format!("memory/{subdir}"), MEMORY_STAT, None);
         }
     }
 
@@ -560,7 +595,7 @@ mod tests {
 
     impl Setup {
         fn new() -> Self {
-            Self(tempfile::tempdir().unwrap(), rand::thread_rng())
+            Self(tempfile::tempdir().unwrap(), rand::rng())
         }
 
         async fn test(&self) {
@@ -601,6 +636,22 @@ mod tests {
                 count_name(&metrics, "cgroup_memory_file_bytes"),
                 SUBDIRS.len()
             );
+            assert_eq!(
+                count_name(&metrics, "cgroup_memory_anon_active_bytes"),
+                SUBDIRS.len()
+            );
+            assert_eq!(
+                count_name(&metrics, "cgroup_memory_anon_inactive_bytes"),
+                SUBDIRS.len()
+            );
+            assert_eq!(
+                count_name(&metrics, "cgroup_memory_file_active_bytes"),
+                SUBDIRS.len()
+            );
+            assert_eq!(
+                count_name(&metrics, "cgroup_memory_file_inactive_bytes"),
+                SUBDIRS.len()
+            );
         }
 
         fn group(&mut self, subdir: &str, flags: usize, controllers: Option<&str>) {
@@ -617,9 +668,9 @@ mod tests {
         }
 
         fn cpu_stat(&mut self, subdir: &str) {
-            let a = self.1.gen_range(1000000..1000000000);
-            let b = self.1.gen_range(1000000..1000000000);
-            let c = self.1.gen_range(1000000..1000000000);
+            let a = self.1.random_range(1000000..1000000000);
+            let b = self.1.random_range(1000000..1000000000);
+            let c = self.1.random_range(1000000..1000000000);
             self.f(
                 subdir,
                 "cpu.stat",
@@ -628,8 +679,8 @@ mod tests {
         }
 
         fn memory_stat(&mut self, subdir: &str) {
-            let anon = self.1.gen_range(1000000..1000000000);
-            let file = self.1.gen_range(1000000..1000000000);
+            let anon = self.1.random_range(1000000..1000000000);
+            let file = self.1.random_range(1000000..1000000000);
             self.f(
                 subdir,
                 "memory.stat",

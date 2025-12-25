@@ -3,6 +3,10 @@
 // Datadog component type, whether it's used in integration tests, etc.
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
+
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use vector_lib::{
     event::DatadogMetricOriginMetadata, schema::meaning, sensitive_string::SensitiveString,
@@ -13,6 +17,8 @@ pub(crate) const DD_EU_SITE: &str = "datadoghq.eu";
 
 /// The datadog tags event path.
 pub const DDTAGS: &str = "ddtags";
+/// The datadog message event path.
+pub const MESSAGE: &str = "message";
 
 /// Mapping of the semantic meaning of well known Datadog reserved attributes
 /// to the field name that Datadog intake expects.
@@ -25,6 +31,13 @@ pub const DD_RESERVED_SEMANTIC_ATTRS: [(&str, &str); 6] = [
     (meaning::SOURCE, "ddsource"),
     (meaning::TAGS, DDTAGS),
 ];
+
+/// Returns true if the parameter `attr` is one of the reserved Datadog log attributes
+pub fn is_reserved_attribute(attr: &str) -> bool {
+    DD_RESERVED_SEMANTIC_ATTRS
+        .iter()
+        .any(|(_, attr_str)| &attr == attr_str)
+}
 
 /// DatadogSeriesMetric
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -79,10 +92,28 @@ pub struct DatadogPoint<T>(pub i64, pub T);
 /// Gets the base API endpoint to use for any calls to Datadog.
 ///
 /// If `endpoint` is not specified, we fallback to `site`.
-pub(crate) fn get_api_base_endpoint(endpoint: Option<&String>, site: &str) -> String {
-    endpoint
-        .cloned()
-        .unwrap_or_else(|| format!("https://api.{}", site))
+pub(crate) fn get_api_base_endpoint(endpoint: Option<&str>, site: &str) -> String {
+    endpoint.map_or_else(|| format!("https://api.{site}"), compute_api_endpoint)
+}
+
+/// Computes the Datadog API endpoint from a given endpoint string.
+///
+/// This scans the given endpoint for the common Datadog domain names; and, if found, rewrites the
+/// endpoint string using the standard API URI. If not found, the endpoint is used as-is.
+fn compute_api_endpoint(endpoint: &str) -> String {
+    // This mechanism is derived from the forwarder health check in the Datadog Agent:
+    // https://github.com/DataDog/datadog-agent/blob/cdcf0fc809b9ac1cd6e08057b4971c7dbb8dbe30/comp/forwarder/defaultforwarder/forwarder_health.go#L45-L47
+    // https://github.com/DataDog/datadog-agent/blob/cdcf0fc809b9ac1cd6e08057b4971c7dbb8dbe30/comp/forwarder/defaultforwarder/forwarder_health.go#L188-L190
+    static DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:[a-z]{2}\d\.)?(datadoghq\.[a-z]+|ddog-gov\.com)/*$")
+            .expect("Could not build Datadog domain regex")
+    });
+
+    if let Some(caps) = DOMAIN_REGEX.captures(endpoint) {
+        format!("https://api.{}", &caps[1])
+    } else {
+        endpoint.into()
+    }
 }
 
 /// Default settings to use for Datadog components.
@@ -108,4 +139,55 @@ fn default_api_key() -> Option<SensitiveString> {
 
 pub(crate) fn default_site() -> String {
     std::env::var("DD_SITE").unwrap_or(DD_US_SITE.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use similar_asserts::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn computes_correct_api_endpoint() {
+        assert_eq!(
+            compute_api_endpoint("https://http-intake.logs.datadoghq.com"),
+            "https://api.datadoghq.com"
+        );
+        assert_eq!(
+            compute_api_endpoint("https://http-intake.logs.datadoghq.com/"),
+            "https://api.datadoghq.com"
+        );
+        assert_eq!(
+            compute_api_endpoint("http://http-intake.logs.datadoghq.com/"),
+            "https://api.datadoghq.com"
+        );
+        assert_eq!(
+            compute_api_endpoint("https://anythingelse.datadoghq.com/"),
+            "https://api.datadoghq.com"
+        );
+        assert_eq!(
+            compute_api_endpoint("https://this.datadoghq.eu/"),
+            "https://api.datadoghq.eu"
+        );
+        assert_eq!(
+            compute_api_endpoint("http://datadog.com/"),
+            "http://datadog.com/"
+        );
+    }
+
+    #[test]
+    fn gets_correct_api_base_endpoint() {
+        assert_eq!(
+            get_api_base_endpoint(None, DD_US_SITE),
+            "https://api.datadoghq.com"
+        );
+        assert_eq!(
+            get_api_base_endpoint(None, "datadog.net"),
+            "https://api.datadog.net"
+        );
+        assert_eq!(
+            get_api_base_endpoint(Some("https://logs.datadoghq.eu"), DD_US_SITE),
+            "https://api.datadoghq.eu"
+        );
+    }
 }

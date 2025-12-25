@@ -1,51 +1,60 @@
-use std::collections::HashMap;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{self, Read},
     path::PathBuf,
+    sync::Mutex,
 };
 
 use snafu::{ResultExt, Snafu};
-use vector_lib::codecs::MetricTagValues;
-use vector_lib::compile_vrl;
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::{metadata_path, owned_value_path, PathPrefix};
-use vector_lib::schema::Definition;
-use vector_lib::TimeZone;
+use vector_lib::{
+    TimeZone,
+    codecs::MetricTagValues,
+    compile_vrl,
+    config::LogNamespace,
+    configurable::configurable_component,
+    enrichment::TableRegistry,
+    lookup::{PathPrefix, metadata_path, owned_value_path},
+    schema::Definition,
+};
 use vector_vrl_functions::set_semantic_meaning::MeaningList;
-use vrl::compiler::runtime::{Runtime, Terminate};
-use vrl::compiler::state::ExternalEnv;
-use vrl::compiler::{CompileConfig, ExpressionError, Function, Program, TypeState, VrlRuntime};
-use vrl::diagnostic::{DiagnosticMessage, Formatter, Note};
-use vrl::path;
-use vrl::path::ValuePath;
-use vrl::value::{Kind, Value};
+use vrl::{
+    compiler::{
+        CompileConfig, ExpressionError, Program, TypeState, VrlRuntime,
+        runtime::{Runtime, Terminate},
+        state::ExternalEnv,
+    },
+    diagnostic::{DiagnosticMessage, Note},
+    path,
+    path::ValuePath,
+    value::{Kind, Value},
+};
 
-use crate::config::OutputId;
 use crate::{
+    Result,
     config::{
-        log_schema, ComponentKey, DataType, Input, TransformConfig, TransformContext,
-        TransformOutput,
+        ComponentKey, DataType, Input, OutputId, TransformConfig, TransformContext,
+        TransformOutput, log_schema,
     },
     event::{Event, TargetEvents, VrlTarget},
+    format_vrl_diagnostics,
     internal_events::{RemapMappingAbort, RemapMappingError},
     schema,
     transforms::{SyncTransform, Transform, TransformOutputsBuf},
-    Result,
 };
 
 const DROPPED: &str = "dropped";
+type CacheKey = (TableRegistry, schema::Definition);
+type CacheValue = (Program, String, MeaningList);
 
 /// Configuration for the `remap` transform.
 #[configurable_component(transform(
     "remap",
     "Modify your observability data as it passes through your topology using Vector Remap Language (VRL)."
 ))]
-#[derive(Clone, Debug, Derivative)]
+#[derive(Derivative)]
 #[serde(deny_unknown_fields)]
-#[derivative(Default)]
+#[derivative(Default, Debug)]
 pub struct RemapConfig {
     /// The [Vector Remap Language][vrl] (VRL) program to execute for each event.
     ///
@@ -67,6 +76,16 @@ pub struct RemapConfig {
     /// [vrl]: https://vector.dev/docs/reference/vrl
     #[configurable(metadata(docs::examples = "./my/program.vrl"))]
     pub file: Option<PathBuf>,
+
+    /// File paths to the [Vector Remap Language][vrl] (VRL) programs to execute for each event.
+    ///
+    /// If a relative path is provided, its root is the current working directory.
+    ///
+    /// Required if `source` or `file` are missing.
+    ///
+    /// [vrl]: https://vector.dev/docs/reference/vrl
+    #[configurable(metadata(docs::examples = "['./my/program.vrl', './my/program2.vrl']"))]
+    pub files: Option<Vec<PathBuf>>,
 
     /// When set to `single`, metric tag values are exposed as single strings, the
     /// same as they were before this config option. Tags with multiple values show the last assigned value, and null values
@@ -133,32 +152,63 @@ pub struct RemapConfig {
     #[configurable(derived, metadata(docs::hidden))]
     #[serde(default)]
     pub runtime: VrlRuntime,
+
+    #[configurable(derived, metadata(docs::hidden))]
+    #[serde(skip)]
+    #[derivative(Debug = "ignore")]
+    /// Cache can't be `BTreeMap` or `HashMap` because of `TableRegistry`, which doesn't allow us to inspect tables inside it.
+    /// And even if we allowed the inspection, the tables can be huge, resulting in a long comparison or hash computation
+    /// while using `Vec` allows us to use just a shallow comparison
+    pub cache: Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>,
+}
+
+impl Clone for RemapConfig {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            file: self.file.clone(),
+            files: self.files.clone(),
+            metric_tag_values: self.metric_tag_values,
+            timezone: self.timezone,
+            drop_on_error: self.drop_on_error,
+            drop_on_abort: self.drop_on_abort,
+            reroute_dropped: self.reroute_dropped,
+            runtime: self.runtime,
+            cache: Mutex::new(Default::default()),
+        }
+    }
 }
 
 impl RemapConfig {
     fn compile_vrl_program(
         &self,
-        enrichment_tables: vector_lib::enrichment::TableRegistry,
+        enrichment_tables: TableRegistry,
         merged_schema_definition: schema::Definition,
-    ) -> Result<(Program, String, Vec<Box<dyn Function>>, CompileConfig)> {
-        let source = match (&self.source, &self.file) {
-            (Some(source), None) => source.to_owned(),
-            (None, Some(path)) => {
-                let mut buffer = String::new();
+    ) -> Result<(Program, String, MeaningList)> {
+        if let Some((_, res)) = self
+            .cache
+            .lock()
+            .expect("Data poisoned")
+            .iter()
+            .find(|v| v.0.0 == enrichment_tables && v.0.1 == merged_schema_definition)
+        {
+            return res.clone().map_err(Into::into);
+        }
 
-                File::open(path)
-                    .with_context(|_| FileOpenFailedSnafu { path })?
-                    .read_to_string(&mut buffer)
-                    .with_context(|_| FileReadFailedSnafu { path })?;
-
-                buffer
+        let source = match (&self.source, &self.file, &self.files) {
+            (Some(source), None, None) => source.to_owned(),
+            (None, Some(path), None) => Self::read_file(path)?,
+            (None, None, Some(paths)) => {
+                let mut combined_source = String::new();
+                for path in paths {
+                    let content = Self::read_file(path)?;
+                    combined_source.push_str(&content);
+                    combined_source.push('\n');
+                }
+                combined_source
             }
-            _ => return Err(Box::new(BuildError::SourceAndOrFile)),
+            _ => return Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
         };
-
-        let mut functions = vrl::stdlib::all();
-        functions.append(&mut vector_lib::enrichment::vrl_functions());
-        functions.append(&mut vector_vrl_functions::all());
 
         let state = TypeState {
             local: Default::default(),
@@ -169,24 +219,34 @@ impl RemapConfig {
         };
         let mut config = CompileConfig::default();
 
-        config.set_custom(enrichment_tables);
+        config.set_custom(enrichment_tables.clone());
         config.set_custom(MeaningList::default());
 
-        compile_vrl(&source, &functions, &state, config)
-            .map_err(|diagnostics| {
-                Formatter::new(&source, diagnostics)
-                    .colored()
-                    .to_string()
-                    .into()
-            })
+        let res = compile_vrl(&source, &vector_vrl_functions::all(), &state, config)
+            .map_err(|diagnostics| format_vrl_diagnostics(&source, diagnostics))
             .map(|result| {
                 (
                     result.program,
-                    Formatter::new(&source, result.warnings).to_string(),
-                    functions,
-                    result.config,
+                    format_vrl_diagnostics(&source, result.warnings),
+                    result.config.get_custom::<MeaningList>().unwrap().clone(),
                 )
-            })
+            });
+
+        self.cache
+            .lock()
+            .expect("Data poisoned")
+            .push(((enrichment_tables, merged_schema_definition), res.clone()));
+
+        res.map_err(Into::into)
+    }
+
+    fn read_file(path: &PathBuf) -> Result<String> {
+        let mut buffer = String::new();
+        File::open(path)
+            .with_context(|_| FileOpenFailedSnafu { path })?
+            .read_to_string(&mut buffer)
+            .with_context(|_| FileReadFailedSnafu { path })?;
+        Ok(buffer)
     }
 }
 
@@ -235,16 +295,7 @@ impl TransformConfig for RemapConfig {
         // step.
         let compiled = self
             .compile_vrl_program(enrichment_tables, merged_definition)
-            .map(|(program, _, _, external_context)| {
-                (
-                    program.final_type_info().state,
-                    external_context
-                        .get_custom::<MeaningList>()
-                        .cloned()
-                        .expect("context exists")
-                        .0,
-                )
-            })
+            .map(|(program, _, meaning_list)| (program.final_type_info().state, meaning_list.0))
             .map_err(|_| ());
 
         let mut dropped_definitions = HashMap::new();
@@ -331,6 +382,13 @@ impl TransformConfig for RemapConfig {
     fn enable_concurrency(&self) -> bool {
         true
     }
+
+    fn files_to_watch(&self) -> Vec<&PathBuf> {
+        self.file
+            .iter()
+            .chain(self.files.iter().flatten())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -388,7 +446,7 @@ impl Remap<AstRunner> {
         config: RemapConfig,
         context: &TransformContext,
     ) -> crate::Result<(Self, String)> {
-        let (program, warnings, _, _) = config.compile_vrl_program(
+        let (program, warnings, _) = config.compile_vrl_program(
             context.enrichment_tables.clone(),
             context.merged_schema_definition.clone(),
         )?;
@@ -433,8 +491,7 @@ where
         let message = error
             .notes()
             .iter()
-            .filter(|note| matches!(note, Note::UserErrorMessage(_)))
-            .last()
+            .rfind(|note| matches!(note, Note::UserErrorMessage(_)))
             .map(|note| note.to_string())
             .unwrap_or_else(|| error.to_string());
         serde_json::json!({
@@ -448,7 +505,7 @@ where
 
     fn annotate_dropped(&self, event: &mut Event, reason: &str, error: ExpressionError) {
         match event {
-            Event::Log(ref mut log) => match log.namespace() {
+            Event::Log(log) => match log.namespace() {
                 LogNamespace::Legacy => {
                     if let Some(metadata_key) = log_schema().metadata_key() {
                         log.insert(
@@ -464,27 +521,27 @@ where
                     );
                 }
             },
-            Event::Metric(ref mut metric) => {
+            Event::Metric(metric) => {
                 if let Some(metadata_key) = log_schema().metadata_key() {
-                    metric.replace_tag(format!("{}.dropped.reason", metadata_key), reason.into());
+                    metric.replace_tag(format!("{metadata_key}.dropped.reason"), reason.into());
                     metric.replace_tag(
-                        format!("{}.dropped.component_id", metadata_key),
+                        format!("{metadata_key}.dropped.component_id"),
                         self.component_key
                             .as_ref()
                             .map(ToString::to_string)
                             .unwrap_or_default(),
                     );
                     metric.replace_tag(
-                        format!("{}.dropped.component_type", metadata_key),
+                        format!("{metadata_key}.dropped.component_type"),
                         "remap".into(),
                     );
                     metric.replace_tag(
-                        format!("{}.dropped.component_kind", metadata_key),
+                        format!("{metadata_key}.dropped.component_kind"),
                         "transform".into(),
                     );
                 }
             }
-            Event::Trace(ref mut trace) => {
+            Event::Trace(trace) => {
                 trace.maybe_insert(log_schema().metadata_key_target_path(), || {
                     self.dropped_data(reason, error).into()
                 });
@@ -593,8 +650,8 @@ fn push_dropped(event: Event, output: &mut TransformOutputsBuf) {
 
 #[derive(Debug, Snafu)]
 pub enum BuildError {
-    #[snafu(display("must provide exactly one of `source` or `file` configuration"))]
-    SourceAndOrFile,
+    #[snafu(display("must provide exactly one of `source` or `file` or `files` configuration"))]
+    SourceAndOrFileOrFiles,
 
     #[snafu(display("Could not open vrl program {:?}: {}", path, source))]
     FileOpenFailed { path: PathBuf, source: io::Error },
@@ -604,33 +661,34 @@ pub enum BuildError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
-
-    use indoc::{formatdoc, indoc};
-    use vector_lib::{config::GlobalOptions, event::EventMetadata, metric_tags};
-    use vrl::value::kind::Collection;
-    use vrl::{btreemap, event_path};
-
-    use super::*;
-    use crate::metrics::Controller;
-    use crate::{
-        config::{build_unit_tests, ConfigBuilder},
-        event::{
-            metric::{MetricKind, MetricValue},
-            LogEvent, Metric, Value,
-        },
-        schema,
-        test_util::components::{
-            assert_transform_compliance, init_test, COMPONENT_MULTIPLE_OUTPUTS_TESTS,
-        },
-        transforms::test::create_topology,
-        transforms::OutputBuffer,
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
     };
+
     use chrono::DateTime;
+    use indoc::{formatdoc, indoc};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
-    use vector_lib::enrichment::TableRegistry;
+    use vector_lib::{
+        config::GlobalOptions, enrichment::TableRegistry, event::EventMetadata, metric_tags,
+    };
+    use vrl::{btreemap, event_path, value::kind::Collection};
+
+    use super::*;
+    use crate::{
+        config::{ConfigBuilder, build_unit_tests},
+        event::{
+            LogEvent, Metric, Value,
+            metric::{MetricKind, MetricValue},
+        },
+        metrics::Controller,
+        schema,
+        test_util::components::{
+            COMPONENT_MULTIPLE_OUTPUTS_TESTS, assert_transform_compliance, init_test,
+        },
+        transforms::{OutputBuffer, test::create_topology},
+    };
 
     fn test_default_schema_definition() -> schema::Definition {
         schema::Definition::empty_legacy_namespace().with_event_field(
@@ -680,7 +738,7 @@ mod tests {
         let err = remap(config).unwrap_err().to_string();
         assert_eq!(
             &err,
-            "must provide exactly one of `source` or `file` configuration"
+            "must provide exactly one of `source` or `file` or `files` configuration"
         )
     }
 
@@ -695,7 +753,7 @@ mod tests {
         let err = remap(config).unwrap_err().to_string();
         assert_eq!(
             &err,
-            "must provide exactly one of `source` or `file` configuration"
+            "must provide exactly one of `source` or `file` or `files` configuration"
         )
     }
 
@@ -826,9 +884,9 @@ mod tests {
 
         let conf = RemapConfig {
             source: Some(
-                indoc! {r#"
+                indoc! {r"
                 . = .events
-            "#}
+            "}
                 .to_owned(),
             ),
             file: None,
@@ -1562,7 +1620,7 @@ mod tests {
         match (buf.pop(), err_buf.pop()) {
             (Some(good), None) => Ok(good),
             (None, Some(bad)) => Err(bad),
-            (a, b) => panic!("expected output xor error output, got {:?} and {:?}", a, b),
+            (a, b) => panic!("expected output xor error output, got {a:?} and {b:?}"),
         }
     }
 
@@ -1754,7 +1812,7 @@ mod tests {
         // An abort should not change the typedef.
 
         let transform1 = RemapConfig {
-            source: Some(r#"abort"#.to_string()),
+            source: Some(r"abort".to_string()),
             ..Default::default()
         };
 
@@ -1924,8 +1982,8 @@ mod tests {
 
         let conf = RemapConfig {
             source: Some(
-                r#". = [null]
-"#
+                r". = [null]
+"
                 .to_string(),
             ),
             file: None,

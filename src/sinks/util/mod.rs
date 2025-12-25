@@ -6,6 +6,7 @@ pub mod batch;
 pub mod buffer;
 pub mod builder;
 pub mod compressor;
+pub mod datagram;
 pub mod encoding;
 pub mod http;
 pub mod metadata;
@@ -23,7 +24,7 @@ pub mod tcp;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test;
 pub mod udp;
-#[cfg(all(any(feature = "sinks-socket", feature = "sinks-statsd"), unix))]
+#[cfg(unix)]
 pub mod unix;
 pub mod uri;
 pub mod zstd;
@@ -36,12 +37,13 @@ pub use batch::{
     RealtimeSizeBasedDefaultBatchSettings, SinkBatchSettings, Unmerged,
 };
 pub use buffer::{
+    Buffer, Compression, PartitionBuffer, PartitionInnerBuffer,
     json::{BoxedRawValue, JsonArrayBuffer},
     partition::Partition,
     vec::{EncodedLength, VecBuffer},
-    Buffer, Compression, PartitionBuffer, PartitionInnerBuffer,
 };
 pub use builder::SinkBuilderExt;
+use chrono::{FixedOffset, Offset, Utc};
 pub use compressor::Compressor;
 pub use normalizer::Normalizer;
 pub use request_builder::{IncrementalRequestBuilder, RequestBuilder};
@@ -52,10 +54,9 @@ pub use service::{
 pub use sink::{BatchSink, PartitionBatchSink, StreamSink};
 use snafu::Snafu;
 pub use uri::UriSerde;
-use vector_lib::{json_size::JsonSize, TimeZone};
+use vector_lib::{TimeZone, json_size::JsonSize};
 
 use crate::event::EventFinalizers;
-use chrono::{FixedOffset, Offset, Utc};
 
 #[derive(Debug, Snafu)]
 enum SinkBuildError {
@@ -121,7 +122,7 @@ pub fn encode_namespace<'a>(
 ) -> String {
     let name = name.into();
     namespace
-        .map(|namespace| format!("{}{}{}", namespace, delimiter, name))
+        .map(|namespace| format!("{namespace}{delimiter}{name}"))
         .unwrap_or_else(|| name.into_owned())
 }
 

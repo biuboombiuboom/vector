@@ -4,7 +4,6 @@ use snafu::Snafu;
 use vector_lib::config::SourceOutput;
 
 pub(super) use crate::schema::Definition;
-
 use crate::{
     config::{ComponentKey, Config, OutputId, SinkOuter, TransformOutput},
     topology,
@@ -328,8 +327,7 @@ pub(super) fn validate_sink_expectations(
                 &mut err
                     .errors()
                     .iter()
-                    .cloned()
-                    .map(|err| format!("schema error in component {}: {}", key, err))
+                    .map(|err| format!("schema error in component {key}: {err}"))
                     .collect(),
             );
         }
@@ -443,8 +441,10 @@ mod tests {
 
     use indexmap::IndexMap;
     use similar_asserts::assert_eq;
-    use vector_lib::config::{DataType, SourceOutput, TransformOutput};
-    use vector_lib::lookup::owned_value_path;
+    use vector_lib::{
+        config::{DataType, SourceOutput, TransformOutput},
+        lookup::owned_value_path,
+    };
     use vrl::value::Kind;
 
     use super::*;
@@ -497,7 +497,7 @@ mod tests {
                     inputs: vec![("foo", None)],
                     sources: IndexMap::from([(
                         "foo",
-                        vec![SourceOutput::new_logs(
+                        vec![SourceOutput::new_maybe_logs(
                             DataType::all_bits(),
                             Definition::default_legacy_namespace(),
                         )],
@@ -512,7 +512,7 @@ mod tests {
                     inputs: vec![("source-foo", None)],
                     sources: IndexMap::from([(
                         "source-foo",
-                        vec![SourceOutput::new_logs(
+                        vec![SourceOutput::new_maybe_logs(
                             DataType::all_bits(),
                             Definition::empty_legacy_namespace().with_event_field(
                                 &owned_value_path!("foo"),
@@ -539,7 +539,7 @@ mod tests {
                     sources: IndexMap::from([
                         (
                             "source-foo",
-                            vec![SourceOutput::new_logs(
+                            vec![SourceOutput::new_maybe_logs(
                                 DataType::all_bits(),
                                 Definition::empty_legacy_namespace().with_event_field(
                                     &owned_value_path!("foo"),
@@ -550,7 +550,7 @@ mod tests {
                         ),
                         (
                             "source-bar",
-                            vec![SourceOutput::new_logs(
+                            vec![SourceOutput::new_maybe_logs(
                                 DataType::all_bits(),
                                 Definition::empty_legacy_namespace().with_event_field(
                                     &owned_value_path!("foo"),
@@ -588,7 +588,7 @@ mod tests {
                     sources: IndexMap::from([
                         (
                             "source-foo",
-                            vec![SourceOutput::new_logs(
+                            vec![SourceOutput::new_maybe_logs(
                                 DataType::all_bits(),
                                 Definition::empty_legacy_namespace().with_event_field(
                                     &owned_value_path!("foo"),
@@ -599,7 +599,7 @@ mod tests {
                         ),
                         (
                             "source-bar",
-                            vec![SourceOutput::new_logs(
+                            vec![SourceOutput::new_maybe_logs(
                                 DataType::all_bits(),
                                 Definition::empty_legacy_namespace().with_event_field(
                                     &owned_value_path!("bar"),
@@ -662,7 +662,7 @@ mod tests {
                     sources: IndexMap::from([
                         (
                             "Source 1",
-                            vec![SourceOutput::new_logs(
+                            vec![SourceOutput::new_maybe_logs(
                                 DataType::all_bits(),
                                 Definition::empty_legacy_namespace().with_event_field(
                                     &owned_value_path!("source-1"),
@@ -673,7 +673,7 @@ mod tests {
                         ),
                         (
                             "Source 2",
-                            vec![SourceOutput::new_logs(
+                            vec![SourceOutput::new_maybe_logs(
                                 DataType::all_bits(),
                                 Definition::empty_legacy_namespace().with_event_field(
                                     &owned_value_path!("source-2"),

@@ -1,30 +1,32 @@
 //! This sink sends data to Google Chronicles unstructured log entries endpoint.
 //! See <https://cloud.google.com/chronicle/docs/reference/ingestion-api#unstructuredlogentries>
 //! for more information.
+use std::{collections::HashMap, io};
+
 use bytes::{Bytes, BytesMut};
 use futures_util::{future::BoxFuture, task::Poll};
 use goauth::scopes::Scope;
-use http::{header::HeaderValue, Request, StatusCode, Uri};
+use http::{
+    Request, StatusCode, Uri,
+    header::{self, HeaderName, HeaderValue},
+};
 use hyper::Body;
 use indoc::indoc;
 use serde::Serialize;
 use serde_json::json;
 use snafu::Snafu;
-use std::collections::HashMap;
-use std::io;
 use tokio_util::codec::Encoder as _;
 use tower::{Service, ServiceBuilder};
-use vector_lib::configurable::configurable_component;
-use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::{
-    config::{telemetry, AcknowledgementsConfig, Input},
-    event::{Event, EventFinalizers, Finalizable},
-    sink::VectorSink,
     EstimatedJsonEncodedSizeOf,
+    config::{AcknowledgementsConfig, Input, telemetry},
+    configurable::configurable_component,
+    event::{Event, EventFinalizers, Finalizable},
+    request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+    sink::VectorSink,
 };
 use vrl::value::Kind;
 
-use crate::sinks::util::service::TowerRequestConfigDefaults;
 use crate::{
     codecs::{self, EncodingConfig},
     config::{GenerateConfig, SinkConfig, SinkContext},
@@ -32,19 +34,23 @@ use crate::{
     http::HttpClient,
     schema,
     sinks::{
+        Healthcheck,
+        gcp_chronicle::{
+            compression::ChronicleCompression,
+            partitioner::{ChroniclePartitionKey, ChroniclePartitioner},
+            sink::ChronicleSink,
+        },
         gcs_common::{
-            config::{healthcheck_response, GcsRetryLogic},
+            config::{GcsRetryLogic, healthcheck_response},
             service::GcsResponse,
-            sink::GcsSink,
         },
         util::{
-            encoding::{as_tracked_write, Encoder},
-            metadata::RequestMetadataBuilder,
-            partitioner::KeyPartitioner,
-            request_builder::EncodeResult,
             BatchConfig, Compression, RequestBuilder, SinkBatchSettings, TowerRequestConfig,
+            encoding::{Encoder, as_tracked_write},
+            metadata::RequestMetadataBuilder,
+            request_builder::EncodeResult,
+            service::TowerRequestConfigDefaults,
         },
-        Healthcheck,
     },
     template::{Template, TemplateParseError},
     tls::{TlsConfig, TlsSettings},
@@ -65,14 +71,56 @@ pub enum GcsHealthcheckError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Region {
-    /// EU region.
+    /// European Multi region
     Eu,
 
-    /// US region.
+    /// US Multi region
     Us,
 
-    /// APAC region.
+    /// APAC region (this is the same as the Singapore region endpoint retained for backwards compatibility)
     Asia,
+
+    /// SãoPaulo Region
+    SãoPaulo,
+
+    /// Canada Region
+    Canada,
+
+    /// Dammam Region
+    Dammam,
+
+    /// Doha Region
+    Doha,
+
+    /// Frankfurt Region
+    Frankfurt,
+
+    /// London Region
+    London,
+
+    /// Mumbai Region
+    Mumbai,
+
+    /// Paris Region
+    Paris,
+
+    /// Singapore Region
+    Singapore,
+
+    /// Sydney Region
+    Sydney,
+
+    /// TelAviv Region
+    TelAviv,
+
+    /// Tokyo Region
+    Tokyo,
+
+    /// Turin Region
+    Turin,
+
+    /// Zurich Region
+    Zurich,
 }
 
 impl Region {
@@ -82,6 +130,22 @@ impl Region {
             Region::Eu => "https://europe-malachiteingestion-pa.googleapis.com",
             Region::Us => "https://malachiteingestion-pa.googleapis.com",
             Region::Asia => "https://asia-southeast1-malachiteingestion-pa.googleapis.com",
+            Region::SãoPaulo => "https://southamerica-east1-malachiteingestion-pa.googleapis.com",
+            Region::Canada => {
+                "https://northamerica-northeast2-malachiteingestion-pa.googleapis.com"
+            }
+            Region::Dammam => "https://me-central2-malachiteingestion-pa.googleapis.com",
+            Region::Doha => "https://me-central1-malachiteingestion-pa.googleapis.com",
+            Region::Frankfurt => "https://europe-west3-malachiteingestion-pa.googleapis.com",
+            Region::London => "https://europe-west2-malachiteingestion-pa.googleapis.com",
+            Region::Mumbai => "https://asia-south1-malachiteingestion-pa.googleapis.com",
+            Region::Paris => "https://europe-west9-malachiteingestion-pa.googleapis.com",
+            Region::Singapore => "https://asia-southeast1-malachiteingestion-pa.googleapis.com",
+            Region::Sydney => "https://australia-southeast1-malachiteingestion-pa.googleapis.com",
+            Region::TelAviv => "https://me-west1-malachiteingestion-pa.googleapis.com",
+            Region::Tokyo => "https://asia-northeast1-malachiteingestion-pa.googleapis.com",
+            Region::Turin => "https://europe-west12-malachiteingestion-pa.googleapis.com",
+            Region::Zurich => "https://europe-west6-malachiteingestion-pa.googleapis.com",
         }
     }
 }
@@ -106,6 +170,7 @@ pub struct ChronicleUnstructuredTowerRequestConfigDefaults;
 impl TowerRequestConfigDefaults for ChronicleUnstructuredTowerRequestConfigDefaults {
     const RATE_LIMIT_NUM: u64 = 1_000;
 }
+
 /// Configuration for the `gcp_chronicle_unstructured` sink.
 #[configurable_component(sink(
     "gcp_chronicle_unstructured",
@@ -130,8 +195,13 @@ pub struct ChronicleUnstructuredConfig {
     pub customer_id: String,
 
     /// User-configured environment namespace to identify the data domain the logs originated from.
-    #[configurable(metadata(docs::examples = "production"))]
-    pub namespace: Option<String>,
+    #[configurable(metadata(docs::templateable))]
+    #[configurable(metadata(
+        docs::examples = "production",
+        docs::examples = "production-{{ namespace }}",
+    ))]
+    #[configurable(metadata(docs::advanced))]
+    pub namespace: Option<Template>,
 
     /// A set of labels that are attached to each batch of events.
     #[configurable(metadata(docs::examples = "chronicle_labels_examples()"))]
@@ -148,6 +218,10 @@ pub struct ChronicleUnstructuredConfig {
     #[configurable(derived)]
     pub encoding: EncodingConfig,
 
+    #[serde(default)]
+    #[configurable(derived)]
+    pub compression: ChronicleCompression,
+
     #[configurable(derived)]
     #[serde(default)]
     pub request: TowerRequestConfig<ChronicleUnstructuredTowerRequestConfigDefaults>,
@@ -163,6 +237,10 @@ pub struct ChronicleUnstructuredConfig {
     /// [unstructured_log_types_doc]: https://cloud.google.com/chronicle/docs/ingestion/parser-list/supported-default-parsers
     #[configurable(metadata(docs::examples = "WINDOWS_DNS", docs::examples = "{{ log_type }}"))]
     pub log_type: Template,
+
+    /// The default `log_type` to attach to events if the template in `log_type` cannot be resolved.
+    #[configurable(metadata(docs::examples = "VECTOR_DEV"))]
+    pub fallback_log_type: Option<String>,
 
     #[configurable(derived)]
     #[serde(
@@ -186,7 +264,9 @@ impl GenerateConfig for ChronicleUnstructuredConfig {
             credentials_path = "/path/to/credentials.json"
             customer_id = "customer_id"
             namespace = "namespace"
+            compression = "gzip"
             log_type = "log_type"
+            fallback_log_type = "VECTOR_DEV"
             encoding.codec = "text"
         "#})
         .unwrap()
@@ -225,7 +305,7 @@ impl SinkConfig for ChronicleUnstructuredConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let creds = self.auth.build(Scope::MalachiteIngestion).await?;
 
-        let tls = TlsSettings::from_options(&self.tls)?;
+        let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls, cx.proxy())?;
 
         let endpoint = self.create_endpoint("v2/unstructuredlogentries:batchCreate")?;
@@ -265,21 +345,25 @@ impl ChronicleUnstructuredConfig {
 
         let batch_settings = self.batch.into_batcher_settings()?;
 
-        let partitioner = self.key_partitioner()?;
+        let partitioner = self.partitioner()?;
 
         let svc = ServiceBuilder::new()
-            .settings(request, GcsRetryLogic)
+            .settings(request, GcsRetryLogic::default())
             .service(ChronicleService::new(client, base_url, creds));
 
         let request_settings = ChronicleRequestBuilder::new(self)?;
 
-        let sink = GcsSink::new(svc, request_settings, partitioner, batch_settings, "http");
+        let sink = ChronicleSink::new(svc, request_settings, partitioner, batch_settings, "http");
 
         Ok(VectorSink::from_event_streamsink(sink))
     }
 
-    fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
-        Ok(KeyPartitioner::new(self.log_type.clone()))
+    fn partitioner(&self) -> crate::Result<ChroniclePartitioner> {
+        Ok(ChroniclePartitioner::new(
+            self.log_type.clone(),
+            self.fallback_log_type.clone(),
+            self.namespace.clone(),
+        ))
     }
 
     fn create_endpoint(&self, path: &str) -> Result<String, ChronicleError> {
@@ -300,6 +384,7 @@ impl ChronicleUnstructuredConfig {
 pub struct ChronicleRequest {
     pub body: Bytes,
     pub finalizers: EventFinalizers,
+    pub headers: HashMap<HeaderName, HeaderValue>,
     metadata: RequestMetadata,
 }
 
@@ -333,19 +418,18 @@ struct ChronicleRequestBody {
 #[derive(Clone, Debug)]
 struct ChronicleEncoder {
     customer_id: String,
-    namespace: Option<String>,
     labels: Option<Vec<Label>>,
     encoder: codecs::Encoder<()>,
     transformer: codecs::Transformer,
 }
 
-impl Encoder<(String, Vec<Event>)> for ChronicleEncoder {
+impl Encoder<(ChroniclePartitionKey, Vec<Event>)> for ChronicleEncoder {
     fn encode_input(
         &self,
-        input: (String, Vec<Event>),
+        input: (ChroniclePartitionKey, Vec<Event>),
         writer: &mut dyn io::Write,
     ) -> io::Result<(usize, GroupedCountByteSize)> {
-        let (partition_key, events) = input;
+        let (key, events) = input;
         let mut encoder = self.encoder.clone();
         let mut byte_size = telemetry().create_request_count_byte_size();
         let events = events
@@ -381,9 +465,9 @@ impl Encoder<(String, Vec<Event>)> for ChronicleEncoder {
 
         let json = json!(ChronicleRequestBody {
             customer_id: self.customer_id.clone(),
-            namespace: self.namespace.clone(),
+            namespace: key.namespace,
             labels: self.labels.clone(),
-            log_type: partition_key,
+            log_type: key.log_type,
             entries: events,
         });
 
@@ -402,6 +486,7 @@ impl Encoder<(String, Vec<Event>)> for ChronicleEncoder {
 #[derive(Clone, Debug)]
 struct ChronicleRequestBuilder {
     encoder: ChronicleEncoder,
+    compression: Compression,
 }
 
 struct ChronicleRequestPayload {
@@ -420,16 +505,16 @@ impl AsRef<[u8]> for ChronicleRequestPayload {
     }
 }
 
-impl RequestBuilder<(String, Vec<Event>)> for ChronicleRequestBuilder {
+impl RequestBuilder<(ChroniclePartitionKey, Vec<Event>)> for ChronicleRequestBuilder {
     type Metadata = EventFinalizers;
-    type Events = (String, Vec<Event>);
+    type Events = (ChroniclePartitionKey, Vec<Event>);
     type Encoder = ChronicleEncoder;
     type Payload = ChronicleRequestPayload;
     type Request = ChronicleRequest;
     type Error = io::Error;
 
     fn compression(&self) -> Compression {
-        Compression::None
+        self.compression
     }
 
     fn encoder(&self) -> &Self::Encoder {
@@ -438,7 +523,7 @@ impl RequestBuilder<(String, Vec<Event>)> for ChronicleRequestBuilder {
 
     fn split_input(
         &self,
-        input: (String, Vec<Event>),
+        input: (ChroniclePartitionKey, Vec<Event>),
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (partition_key, mut events) = input;
         let finalizers = events.take_finalizers();
@@ -453,7 +538,33 @@ impl RequestBuilder<(String, Vec<Event>)> for ChronicleRequestBuilder {
         metadata: RequestMetadata,
         payload: EncodeResult<Self::Payload>,
     ) -> Self::Request {
+        let mut headers = HashMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        match payload.compressed_byte_size {
+            Some(compressed_byte_size) => {
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&compressed_byte_size.to_string()).unwrap(),
+                );
+                headers.insert(
+                    header::CONTENT_ENCODING,
+                    HeaderValue::from_str(self.compression.content_encoding().unwrap()).unwrap(),
+                );
+            }
+            None => {
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&payload.uncompressed_byte_size.to_string()).unwrap(),
+                );
+            }
+        }
+
         ChronicleRequest {
+            headers,
             body: payload.into_payload().bytes,
             finalizers,
             metadata,
@@ -471,10 +582,10 @@ impl ChronicleRequestBuilder {
     fn new(config: &ChronicleUnstructuredConfig) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.config().build()?;
+        let compression = Compression::from(config.compression);
         let encoder = crate::codecs::Encoder::<()>::new(serializer);
         let encoder = ChronicleEncoder {
             customer_id: config.customer_id.clone(),
-            namespace: config.namespace.clone(),
             labels: config.labels.as_ref().map(|labs| {
                 labs.iter()
                     .map(|(k, v)| Label {
@@ -486,7 +597,10 @@ impl ChronicleRequestBuilder {
             encoder,
             transformer,
         };
-        Ok(Self { encoder })
+        Ok(Self {
+            encoder,
+            compression,
+        })
     }
 }
 
@@ -526,17 +640,12 @@ impl Service<ChronicleRequest> for ChronicleService {
 
     fn call(&mut self, request: ChronicleRequest) -> Self::Future {
         let mut builder = Request::post(&self.base_url);
-        let headers = builder.headers_mut().unwrap();
-        headers.insert(
-            "content-type",
-            HeaderValue::from_str("application/json").unwrap(),
-        );
-        headers.insert(
-            "content-length",
-            HeaderValue::from_str(&request.body.len().to_string()).unwrap(),
-        );
-
         let metadata = request.get_metadata().clone();
+
+        let headers = builder.headers_mut().unwrap();
+        for (name, value) in request.headers {
+            headers.insert(name, value);
+        }
 
         let mut http_request = builder.body(Body::from(request.body)).unwrap();
         self.creds.apply(&mut http_request);
@@ -570,8 +679,8 @@ mod integration_tests {
     use super::*;
     use crate::test_util::{
         components::{
-            run_and_assert_sink_compliance, run_and_assert_sink_error, COMPONENT_ERROR_TAGS,
-            SINK_TAGS,
+            COMPONENT_ERROR_TAGS, SINK_TAGS, run_and_assert_sink_compliance,
+            run_and_assert_sink_error,
         },
         random_events_with_stream, random_string, trace_init,
     };
@@ -604,15 +713,15 @@ mod integration_tests {
         config(log_type, auth_path).build(cx).await
     }
 
+    #[ignore = "https://github.com/vectordotdev/vector/issues/24133"]
     #[tokio::test]
     async fn publish_events() {
         trace_init();
 
         let log_type = random_string(10);
-        let (sink, healthcheck) =
-            config_build(&log_type, "/home/vector/scripts/integration/gcp/auth.json")
-                .await
-                .expect("Building sink failed");
+        let (sink, healthcheck) = config_build(&log_type, "tests/integration/gcp/config/auth.json")
+            .await
+            .expect("Building sink failed");
 
         healthcheck.await.expect("Health check failed");
 
@@ -640,15 +749,12 @@ mod integration_tests {
 
         let log_type = random_string(10);
         // Test with an auth file that doesnt match the public key sent to the dummy chronicle server.
-        let sink = config_build(
-            &log_type,
-            "/home/vector/scripts/integration/gcp/invalidauth.json",
-        )
-        .await;
+        let sink = config_build(&log_type, "tests/integration/gcp/config/invalidauth.json").await;
 
         assert!(sink.is_err())
     }
 
+    #[ignore = "https://github.com/vectordotdev/vector/issues/24133"]
     #[tokio::test]
     async fn publish_invalid_events() {
         trace_init();
@@ -656,10 +762,9 @@ mod integration_tests {
         // The chronicle-emulator we are testing against is setup so a `log_type` of "INVALID"
         // will return a `400 BAD_REQUEST`.
         let log_type = "INVALID";
-        let (sink, healthcheck) =
-            config_build(log_type, "/home/vector/scripts/integration/gcp/auth.json")
-                .await
-                .expect("Building sink failed");
+        let (sink, healthcheck) = config_build(log_type, "tests/integration/gcp/config/auth.json")
+            .await
+            .expect("Building sink failed");
 
         healthcheck.await.expect("Health check failed");
 
@@ -680,13 +785,13 @@ mod integration_tests {
 
     async fn request(method: Method, path: &str, log_type: &str) -> Response {
         let address = std::env::var(ADDRESS_ENV_VAR).unwrap();
-        let url = format!("{}/{}", address, path);
+        let url = format!("{address}/{path}");
         Client::new()
             .request(method.clone(), &url)
             .query(&[("log_type", log_type)])
             .send()
             .await
-            .unwrap_or_else(|_| panic!("Sending {} request to {} failed", method, url))
+            .unwrap_or_else(|_| panic!("Sending {method} request to {url} failed"))
     }
 
     async fn pull_messages(log_type: &str) -> Vec<Log> {

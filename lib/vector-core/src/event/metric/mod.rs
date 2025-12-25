@@ -1,9 +1,5 @@
 #[cfg(feature = "vrl")]
 use std::convert::TryFrom;
-
-#[cfg(feature = "vrl")]
-use vrl::compiler::value::VrlValueConvert;
-
 use std::{
     convert::AsRef,
     fmt::{self, Display, Formatter},
@@ -12,17 +8,19 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use vector_common::{
+    EventDataEq,
     byte_size_of::ByteSizeOf,
     internal_event::{OptionalTag, TaggedEventsSent},
     json_size::JsonSize,
     request_metadata::GetEventCountTags,
-    EventDataEq,
 };
 use vector_config::configurable_component;
+#[cfg(feature = "vrl")]
+use vrl::compiler::value::VrlValueConvert;
 
 use super::{
-    estimated_json_encoded_size_of::EstimatedJsonEncodedSizeOf, BatchNotifier, EventFinalizer,
-    EventFinalizers, EventMetadata, Finalizable,
+    BatchNotifier, EventFinalizer, EventFinalizers, EventMetadata, Finalizable,
+    estimated_json_encoded_size_of::EstimatedJsonEncodedSizeOf,
 };
 use crate::config::telemetry;
 
@@ -504,7 +502,7 @@ impl GetEventCountTags for Metric {
 
 /// Metric kind.
 ///
-/// Metrics can be either absolute of incremental. Absolute metrics represent a sort of "last write wins" scenario,
+/// Metrics can be either absolute or incremental. Absolute metrics represent a sort of "last write wins" scenario,
 /// where the latest absolute value seen is meant to be the actual metric value.  In contrast, and perhaps intuitively,
 /// incremental metrics are meant to be additive, such that we don't know what total value of the metric is, but we know
 /// that we'll be adding or subtracting the given value from it.
@@ -667,7 +665,7 @@ pub fn samples_to_buckets(samples: &[Sample], buckets: &[f64]) -> (Vec<Bucket>, 
 mod test {
     use std::collections::BTreeSet;
 
-    use chrono::{offset::TimeZone, DateTime, Timelike, Utc};
+    use chrono::{DateTime, Timelike, Utc, offset::TimeZone};
     use similar_asserts::assert_eq;
 
     use super::*;

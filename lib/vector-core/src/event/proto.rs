@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::TimeZone;
 use ordered_float::NotNan;
+use uuid::Uuid;
 
 use super::{MetricTags, WithMetadata};
 use crate::{event, metrics::AgentDDSketch};
@@ -16,7 +16,9 @@ pub use metric::Value as MetricValue;
 pub use proto_event::*;
 use vrl::value::{ObjectMap, Value as VrlValue};
 
-use super::{array, metric::MetricSketch, EventMetadata};
+use super::EventFinalizers;
+use super::metadata::{Inner, default_schema_definition};
+use super::{EventMetadata, array, metric::MetricSketch};
 
 impl event_array::Events {
     // We can't use the standard `From` traits here because the actual
@@ -617,21 +619,18 @@ impl From<OutputId> for crate::config::OutputId {
 
 impl From<EventMetadata> for Metadata {
     fn from(value: EventMetadata) -> Self {
-        let EventMetadata {
+        let super::metadata::Inner {
             value,
             secrets,
             source_id,
             source_type,
             upstream_id,
             datadog_origin_metadata,
+            source_event_id,
             ..
-        } = value;
+        } = value.into_owned();
 
-        let secrets = if secrets.is_empty() {
-            None
-        } else {
-            Some(secrets.into())
-        };
+        let secrets = (!secrets.is_empty()).then(|| secrets.into());
 
         Self {
             value: Some(encode_value(value)),
@@ -640,39 +639,56 @@ impl From<EventMetadata> for Metadata {
             source_type: source_type.map(|s| s.to_string()),
             upstream_id: upstream_id.map(|id| id.as_ref().clone()).map(Into::into),
             secrets,
+            source_event_id: source_event_id.map_or(vec![], std::convert::Into::into),
         }
     }
 }
 
 impl From<Metadata> for EventMetadata {
     fn from(value: Metadata) -> Self {
-        let mut metadata = EventMetadata::default();
+        let Metadata {
+            value: metadata_value,
+            source_id,
+            source_type,
+            upstream_id,
+            secrets,
+            datadog_origin_metadata,
+            source_event_id,
+        } = value;
 
-        if let Some(value) = value.value.and_then(decode_value) {
-            *metadata.value_mut() = value;
-        }
+        let metadata_value = metadata_value.and_then(decode_value);
+        let source_id = source_id.map(|s| Arc::new(s.into()));
+        let upstream_id = upstream_id.map(|id| Arc::new(id.into()));
+        let secrets = secrets.map(Into::into);
+        let datadog_origin_metadata = datadog_origin_metadata.map(Into::into);
+        let source_event_id = if source_event_id.is_empty() {
+            None
+        } else {
+            match Uuid::from_slice(&source_event_id) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    error!(
+                        %error,
+                        source_event_id = %String::from_utf8_lossy(&source_event_id),
+                        "Failed to parse source_event_id.",
+                    );
+                    None
+                }
+            }
+        };
 
-        if let Some(source_id) = value.source_id {
-            metadata.set_source_id(Arc::new(source_id.into()));
-        }
-
-        if let Some(source_type) = value.source_type {
-            metadata.set_source_type(source_type);
-        }
-
-        if let Some(upstream_id) = value.upstream_id {
-            metadata.set_upstream_id(Arc::new(upstream_id.into()));
-        }
-
-        if let Some(secrets) = value.secrets {
-            metadata.secrets_mut().merge(secrets.into());
-        }
-
-        if let Some(origin_metadata) = value.datadog_origin_metadata {
-            metadata = metadata.with_origin_metadata(origin_metadata.into());
-        }
-
-        metadata
+        EventMetadata(Arc::new(Inner {
+            value: metadata_value.unwrap_or_else(|| vrl::value::Value::Object(ObjectMap::new())),
+            secrets: secrets.unwrap_or_default(),
+            finalizers: EventFinalizers::default(),
+            source_id,
+            source_type: source_type.map(Into::into),
+            upstream_id,
+            schema_definition: default_schema_definition(),
+            dropped_fields: ObjectMap::new(),
+            datadog_origin_metadata,
+            source_event_id,
+        }))
     }
 }
 

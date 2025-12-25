@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use goauth::scopes::Scope;
-use http::{header::CONTENT_TYPE, Request, Uri};
+use http::{Request, Uri, header::CONTENT_TYPE};
+use snafu::ResultExt;
 
 use super::{
     request_builder::{StackdriverMetricsEncoder, StackdriverMetricsRequestBuilder},
@@ -10,18 +11,16 @@ use crate::{
     gcp::{GcpAuthConfig, GcpAuthenticator},
     http::HttpClient,
     sinks::{
-        gcp,
+        HTTPRequestBuilderSnafu, gcp,
         prelude::*,
         util::{
             http::{
-                http_response_retry_logic, HttpRequest, HttpService, HttpServiceRequestBuilder,
+                HttpRequest, HttpService, HttpServiceRequestBuilder, http_response_retry_logic,
             },
             service::TowerRequestConfigDefaults,
         },
-        HTTPRequestBuilderSnafu,
     },
 };
-use snafu::ResultExt;
 
 #[derive(Clone, Copy, Debug)]
 pub struct StackdriverMetricsTowerRequestConfigDefaults;
@@ -98,7 +97,7 @@ impl SinkConfig for StackdriverConfig {
 
         let healthcheck = healthcheck().boxed();
         let started = chrono::Utc::now();
-        let tls_settings = TlsSettings::from_options(&self.tls)?;
+        let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls_settings, cx.proxy())?;
 
         let batch_settings = self.batch.validate()?.into_batcher_settings()?;

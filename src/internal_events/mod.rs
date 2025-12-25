@@ -2,6 +2,7 @@
 pub mod prelude;
 
 mod adaptive_concurrency;
+#[cfg(feature = "transforms-aggregate")]
 mod aggregate;
 #[cfg(any(feature = "sources-amqp", feature = "sinks-amqp"))]
 mod amqp;
@@ -49,7 +50,7 @@ mod encoding_transcode;
 mod eventstoredb_metrics;
 #[cfg(feature = "sources-exec")]
 mod exec;
-#[cfg(any(feature = "sources-file-descriptor", feature = "sources-stdin"))]
+#[cfg(any(feature = "sources-file_descriptor", feature = "sources-stdin"))]
 mod file_descriptor;
 #[cfg(feature = "transforms-filter")]
 mod filter;
@@ -70,8 +71,6 @@ mod http_client_source;
 mod influxdb;
 #[cfg(feature = "sources-internal_logs")]
 mod internal_logs;
-#[cfg(feature = "sources-internal_metrics")]
-mod internal_metrics;
 #[cfg(all(unix, feature = "sources-journald"))]
 mod journald;
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
@@ -80,6 +79,7 @@ mod kafka;
 mod kubernetes_logs;
 #[cfg(feature = "transforms-log_to_metric")]
 mod log_to_metric;
+#[cfg(feature = "sources-heroku_logs")]
 mod logplex;
 #[cfg(feature = "sinks-loki")]
 mod loki;
@@ -94,6 +94,11 @@ mod mqtt;
 #[cfg(feature = "sources-nginx_metrics")]
 mod nginx_metrics;
 mod open;
+#[cfg(any(
+    feature = "sources-kubernetes_logs",
+    feature = "transforms-log_to_metric",
+    feature = "sinks-datadog_events",
+))]
 mod parser;
 #[cfg(feature = "sources-postgresql_metrics")]
 mod postgresql_metrics;
@@ -110,7 +115,9 @@ mod pulsar;
 mod redis;
 #[cfg(feature = "transforms-impl-reduce")]
 mod reduce;
+#[cfg(feature = "transforms-remap")]
 mod remap;
+#[cfg(feature = "transforms-impl-sample")]
 mod sample;
 #[cfg(feature = "sinks-sematext")]
 mod sematext_metrics;
@@ -126,9 +133,14 @@ mod template;
 #[cfg(feature = "transforms-throttle")]
 mod throttle;
 mod udp;
+#[cfg(unix)]
 mod unix;
-#[cfg(feature = "sinks-websocket")]
+#[cfg(any(feature = "sources-websocket", feature = "sinks-websocket"))]
 mod websocket;
+#[cfg(feature = "sinks-websocket-server")]
+mod websocket_server;
+#[cfg(feature = "transforms-window")]
+mod window;
 
 #[cfg(any(
     feature = "sources-file",
@@ -136,8 +148,12 @@ mod websocket;
     feature = "sinks-file",
 ))]
 mod file;
+
+#[cfg(windows)]
 mod windows;
 
+#[cfg(any(feature = "transforms-log_to_metric", feature = "sinks-loki"))]
+mod expansion;
 #[cfg(feature = "sources-mongodb_metrics")]
 pub(crate) use mongodb_metrics::*;
 
@@ -185,13 +201,15 @@ pub(crate) use self::docker_logs::*;
 pub(crate) use self::eventstoredb_metrics::*;
 #[cfg(feature = "sources-exec")]
 pub(crate) use self::exec::*;
+#[cfg(any(feature = "transforms-log_to_metric", feature = "sinks-loki"))]
+pub use self::expansion::*;
 #[cfg(any(
     feature = "sources-file",
     feature = "sources-kubernetes_logs",
     feature = "sinks-file",
 ))]
 pub(crate) use self::file::*;
-#[cfg(any(feature = "sources-file-descriptor", feature = "sources-stdin"))]
+#[cfg(any(feature = "sources-file_descriptor", feature = "sources-stdin"))]
 pub(crate) use self::file_descriptor::*;
 #[cfg(feature = "transforms-filter")]
 pub(crate) use self::filter::*;
@@ -209,8 +227,6 @@ pub(crate) use self::http_client_source::*;
 pub(crate) use self::influxdb::*;
 #[cfg(feature = "sources-internal_logs")]
 pub(crate) use self::internal_logs::*;
-#[cfg(feature = "sources-internal_metrics")]
-pub(crate) use self::internal_metrics::*;
 #[cfg(all(unix, feature = "sources-journald"))]
 pub(crate) use self::journald::*;
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
@@ -231,7 +247,11 @@ pub(crate) use self::metric_to_log::*;
 pub(crate) use self::mqtt::*;
 #[cfg(feature = "sources-nginx_metrics")]
 pub(crate) use self::nginx_metrics::*;
-#[allow(unused_imports)]
+#[cfg(any(
+    feature = "sources-kubernetes_logs",
+    feature = "transforms-log_to_metric",
+    feature = "sinks-datadog_events",
+))]
 pub(crate) use self::parser::*;
 #[cfg(feature = "sources-postgresql_metrics")]
 pub(crate) use self::postgresql_metrics::*;
@@ -263,8 +283,12 @@ pub(crate) use self::tag_cardinality_limit::*;
 pub(crate) use self::throttle::*;
 #[cfg(unix)]
 pub(crate) use self::unix::*;
-#[cfg(feature = "sinks-websocket")]
+#[cfg(any(feature = "sources-websocket", feature = "sinks-websocket"))]
 pub(crate) use self::websocket::*;
+#[cfg(feature = "sinks-websocket-server")]
+pub(crate) use self::websocket_server::*;
+#[cfg(feature = "transforms-window")]
+pub(crate) use self::window::*;
 #[cfg(windows)]
 pub(crate) use self::windows::*;
 pub use self::{

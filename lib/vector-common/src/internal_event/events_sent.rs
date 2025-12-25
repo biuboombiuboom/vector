@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use metrics::{register_counter, Counter};
+use metrics::{Counter, counter};
 use tracing::trace;
 
-use crate::config::ComponentKey;
-
 use super::{CountByteSize, OptionalTag, Output, SharedString};
+use crate::config::ComponentKey;
 
 pub const DEFAULT_OUTPUT: &str = "_default";
 
@@ -14,14 +13,14 @@ crate::registered_event!(
         output: Option<SharedString>,
     } => {
         events: Counter = if let Some(output) = &self.output {
-            register_counter!("component_sent_events_total", "output" => output.clone())
+            counter!("component_sent_events_total", "output" => output.clone())
         } else {
-            register_counter!("component_sent_events_total")
+            counter!("component_sent_events_total")
         },
         event_bytes: Counter = if let Some(output) = &self.output {
-            register_counter!("component_sent_event_bytes_total", "output" => output.clone())
+            counter!("component_sent_event_bytes_total", "output" => output.clone())
         } else {
-            register_counter!("component_sent_event_bytes_total")
+            counter!("component_sent_event_bytes_total")
         },
         output: Option<SharedString> = self.output,
     }
@@ -76,10 +75,10 @@ crate::registered_event!(
         service: OptionalTag<String>,
     } => {
         events: Counter = {
-            register_counter!("component_sent_events_total", &make_tags(&self.source, &self.service))
+            counter!("component_sent_events_total", &make_tags(&self.source, &self.service))
         },
         event_bytes: Counter = {
-            register_counter!("component_sent_event_bytes_total", &make_tags(&self.source, &self.service))
+            counter!("component_sent_event_bytes_total", &make_tags(&self.source, &self.service))
         },
     }
 

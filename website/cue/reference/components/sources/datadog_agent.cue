@@ -56,7 +56,7 @@ components: sources: datadog_agent: {
 		platform_name: null
 	}
 
-	configuration: base.components.sources.datadog_agent.configuration
+	configuration: generated.components.sources.datadog_agent.configuration
 
 	outputs: [
 		{
@@ -153,7 +153,7 @@ components: sources: datadog_agent: {
 				tags: _extra_tags
 			}
 		}
-		traces: {
+		traces: trace: {
 			description: "A trace received through an HTTP POST request sent by a Datadog Trace Agent."
 			fields: {
 				spans: {
@@ -176,9 +176,11 @@ components: sources: datadog_agent: {
 		decompression: {
 			title: "Configuring the Datadog Agent"
 			body:  """
-				Sending logs or metrics to Vector requires the [Datadog Agent](\(urls.datadog_agent_doc)) v7.35/6.35 or greater.
+				Sending logs or metrics to Vector requires the [Datadog Agent](\(urls.datadog_agent)) v7.35/6.35 or greater.
+				Note that if you are using a Datadog Agent where `zstd` is the default compression mode, then you will also
+				need a Vector version `0.40.2` or later.
 
-				To send logs from a Datadog Agent to this source, the [Datadog Agent](\(urls.datadog_agent_doc)) configuration
+				To send logs from a Datadog Agent to this source, the [Datadog Agent](\(urls.datadog_agent)) configuration
 				must be updated to use:
 
 				```yaml
@@ -187,7 +189,7 @@ components: sources: datadog_agent: {
 					logs.url: http://"<VECTOR_HOST>:<SOURCE_PORT>" # Use https if SSL is enabled in Vector source configuration
 				```
 
-				In order to send metrics the [Datadog Agent](\(urls.datadog_agent_doc)) configuration must be updated with the
+				In order to send metrics the [Datadog Agent](\(urls.datadog_agent)) configuration must be updated with the
 				following options:
 
 				```yaml
@@ -196,7 +198,7 @@ components: sources: datadog_agent: {
 					metrics.url: http://"<VECTOR_HOST>:<SOURCE_PORT>" # Use https if SSL is enabled in Vector source configuration
 				```
 
-				In order to send traces the [Datadog Agent](\(urls.datadog_agent_doc)) configuration must be updated with the
+				In order to send traces the [Datadog Agent](\(urls.datadog_agent)) configuration must be updated with the
 				following options:
 
 				```yaml
@@ -204,6 +206,8 @@ components: sources: datadog_agent: {
 					traces.enabled: true
 					traces.url: http://"<VECTOR_HOST>:<SOURCE_PORT>" # Use https if SSL is enabled in Vector source configuration
 				```
+
+				You can find the agent configuration template [here](\(urls.datadog_agent_vector_config_template)).
 				"""
 		}
 		trace_support: {
@@ -216,9 +220,33 @@ components: sources: datadog_agent: {
 				duration distribution).
 				"""
 		}
+		request_timeouts: {
+			title: "Request timeout handling"
+			body: """
+				When the Datadog Agent sends a request to this Vector source, and the source
+				blocks on sending the events in that request to the connected transforms or sinks,
+				the Agent will eventually time out the request and drop the connection. When that
+				happens, by default, Vector will emit an "Events dropped." error and increment
+				the `component_discarded_events_total` internal metric.
+
+				However, while it is technically true that Vector has dropped the events, the
+				Agent will retry resending that request indefinitely, which means the events will
+				eventually be received unless the blockage above is permanent or the Agent is
+				killed before the request is accepted.
+
+				To prevent this potentially misleading telemetry, you can configure
+				the `send_timeout_secs` option to a
+				value _less than_ the Agent's timeout, which defaults to 10 seconds.
+				This will cause Vector to respond to the Agent when such blockages occur with a HTTP 503
+				Service Unavailable response, emit a warning instead of an error,
+				and increment the `component_timed_out_requests_total` internal metric.
+				"""
+		}
 	}
 
 	telemetry: metrics: {
+		component_timed_out_events_total:     components.sources.internal_metrics.output.metrics.component_timed_out_events_total
+		component_timed_out_requests_total:   components.sources.internal_metrics.output.metrics.component_timed_out_requests_total
 		http_server_handler_duration_seconds: components.sources.internal_metrics.output.metrics.http_server_handler_duration_seconds
 		http_server_requests_received_total:  components.sources.internal_metrics.output.metrics.http_server_requests_received_total
 		http_server_responses_sent_total:     components.sources.internal_metrics.output.metrics.http_server_responses_sent_total

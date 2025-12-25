@@ -2,41 +2,45 @@ use std::{collections::HashMap, convert::TryFrom, io};
 
 use bytes::Bytes;
 use chrono::{FixedOffset, Utc};
-use http::header::{HeaderName, HeaderValue};
-use http::Uri;
+use http::{
+    Uri,
+    header::{HeaderName, HeaderValue},
+};
 use indoc::indoc;
-use snafu::ResultExt;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use tower::ServiceBuilder;
 use uuid::Uuid;
-use vector_lib::codecs::encoding::Framer;
-use vector_lib::configurable::configurable_component;
-use vector_lib::event::{EventFinalizers, Finalizable};
-use vector_lib::{request_metadata::RequestMetadata, TimeZone};
+use vector_lib::{
+    TimeZone,
+    codecs::encoding::Framer,
+    configurable::configurable_component,
+    event::{EventFinalizers, Finalizable},
+    request_metadata::RequestMetadata,
+};
 
-use crate::sinks::util::metadata::RequestMetadataBuilder;
-use crate::sinks::util::service::TowerRequestConfigDefaults;
 use crate::{
     codecs::{Encoder, EncodingConfigWithFraming, SinkType, Transformer},
     config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
     event::Event,
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope},
-    http::{get_http_scheme_from_uri, HttpClient},
+    http::{HttpClient, get_http_scheme_from_uri},
     serde::json::to_string,
     sinks::{
+        Healthcheck, VectorSink,
         gcs_common::{
             config::{
-                build_healthcheck, GcsPredefinedAcl, GcsRetryLogic, GcsStorageClass, BASE_URL,
+                GcsPredefinedAcl, GcsRetryLogic, GcsStorageClass, build_healthcheck,
+                default_endpoint,
             },
             service::{GcsRequest, GcsRequestSettings, GcsService},
             sink::GcsSink,
         },
         util::{
-            batch::BatchConfig, partitioner::KeyPartitioner, request_builder::EncodeResult,
-            timezone_to_offset, BulkSizeBasedDefaultBatchSettings, Compression, RequestBuilder,
-            ServiceBuilderExt, TowerRequestConfig,
+            BulkSizeBasedDefaultBatchSettings, Compression, RequestBuilder, ServiceBuilderExt,
+            TowerRequestConfig, batch::BatchConfig, metadata::RequestMetadataBuilder,
+            partitioner::KeyPartitioner, request_builder::EncodeResult,
+            service::TowerRequestConfigDefaults, timezone_to_offset,
         },
-        Healthcheck, VectorSink,
     },
     template::{Template, TemplateParseError},
     tls::{TlsConfig, TlsSettings},
@@ -147,6 +151,12 @@ pub struct GcsSinkConfig {
     #[serde(flatten)]
     encoding: EncodingConfigWithFraming,
 
+    /// Compression configuration.
+    ///
+    /// All compression algorithms use the default compression level unless otherwise specified.
+    ///
+    /// Some cloud storage API clients and browsers handle decompression transparently, so
+    /// depending on how they are accessed, files may not always appear to be compressed.
     #[configurable(derived)]
     #[serde(default)]
     compression: Compression,
@@ -154,6 +164,12 @@ pub struct GcsSinkConfig {
     #[configurable(derived)]
     #[serde(default)]
     batch: BatchConfig<BulkSizeBasedDefaultBatchSettings>,
+
+    /// API endpoint for Google Cloud Storage
+    #[configurable(metadata(docs::examples = "http://localhost:9000"))]
+    #[configurable(validation(format = "uri"))]
+    #[serde(default = "default_endpoint")]
+    endpoint: String,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -196,6 +212,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> GcsSinkConfig {
         encoding,
         compression: Compression::gzip_default(),
         batch: Default::default(),
+        endpoint: Default::default(),
         request: Default::default(),
         auth: Default::default(),
         tls: Default::default(),
@@ -221,8 +238,8 @@ impl GenerateConfig for GcsSinkConfig {
 impl SinkConfig for GcsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let auth = self.auth.build(Scope::DevStorageReadWrite).await?;
-        let base_url = format!("{}{}/", BASE_URL, self.bucket);
-        let tls = TlsSettings::from_options(&self.tls)?;
+        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
+        let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls, cx.proxy())?;
         let healthcheck = build_healthcheck(
             self.bucket.clone(),
@@ -262,7 +279,7 @@ impl GcsSinkConfig {
         let protocol = get_http_scheme_from_uri(&base_url.parse::<Uri>().unwrap());
 
         let svc = ServiceBuilder::new()
-            .settings(request, GcsRetryLogic)
+            .settings(request, GcsRetryLogic::default())
             .service(GcsService::new(client, base_url, auth));
 
         let request_settings = RequestSettings::new(self, cx)?;
@@ -276,6 +293,7 @@ impl GcsSinkConfig {
         Ok(KeyPartitioner::new(
             Template::try_from(self.key_prefix.as_deref().unwrap_or("date=%F/"))
                 .context(KeyPrefixTemplateSnafu)?,
+            None,
         ))
     }
 }
@@ -431,21 +449,24 @@ fn make_header((name, value): (&String, &String)) -> crate::Result<(HeaderName, 
 #[cfg(test)]
 mod tests {
     use futures_util::{future::ready, stream};
-    use vector_lib::codecs::encoding::FramingConfig;
-    use vector_lib::codecs::{
-        JsonSerializerConfig, NewlineDelimitedEncoderConfig, TextSerializerConfig,
-    };
-    use vector_lib::partition::Partitioner;
-    use vector_lib::request_metadata::GroupedCountByteSize;
-    use vector_lib::EstimatedJsonEncodedSizeOf;
-
-    use crate::event::LogEvent;
-    use crate::test_util::{
-        components::{run_and_assert_sink_compliance, SINK_TAGS},
-        http::{always_200_response, spawn_blackhole_http_server},
+    use vector_lib::{
+        EstimatedJsonEncodedSizeOf,
+        codecs::{
+            JsonSerializerConfig, NewlineDelimitedEncoderConfig, TextSerializerConfig,
+            encoding::FramingConfig,
+        },
+        partition::Partitioner,
+        request_metadata::GroupedCountByteSize,
     };
 
     use super::*;
+    use crate::{
+        event::LogEvent,
+        test_util::{
+            components::{SINK_TAGS, run_and_assert_sink_compliance},
+            http::{always_200_response, spawn_blackhole_http_server},
+        },
+    };
 
     #[test]
     fn generate_config() {

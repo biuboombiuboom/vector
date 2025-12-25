@@ -3,8 +3,7 @@ use futures::StreamExt;
 use http::HeaderMap;
 use indoc::indoc;
 use prost::Message;
-use vector_lib::metric_tags;
-use vector_lib::prometheus::parser::proto;
+use vector_lib::{metric_tags, prometheus::parser::proto};
 
 use super::*;
 use crate::{
@@ -13,7 +12,7 @@ use crate::{
     sinks::{prometheus::remote_write::config::RemoteWriteConfig, util::test::build_test_server},
     test_util::{
         self,
-        components::{assert_sink_compliance, HTTP_SINK_TAGS},
+        components::{HTTP_SINK_TAGS, assert_sink_compliance},
     },
 };
 
@@ -23,7 +22,7 @@ fn generate_config() {
 }
 
 macro_rules! labels {
-        ( $( $name:expr => $value:expr ),* ) => {
+        ( $( $name:expr_2021 => $value:expr_2021 ),* ) => {
             vec![ $( proto::Label {
                 name: $name.to_string(),
                 value: $value.to_string()
@@ -141,7 +140,7 @@ async fn retains_state_between_requests() {
     // This sink converts all incremental events to absolute, and
     // should accumulate their totals between batches.
     let outputs = send_request(
-        r#"batch.max_events = 1"#,
+        r"batch.max_events = 1",
         vec![
             create_inc_event("counter-1".into(), 12.0),
             create_inc_event("counter-2".into(), 13.0),
@@ -167,7 +166,7 @@ async fn retains_state_between_requests() {
 #[tokio::test]
 async fn aggregates_batches() {
     let outputs = send_request(
-        r#"batch.max_events = 3"#,
+        r"batch.max_events = 3",
         vec![
             create_inc_event("counter-1".into(), 12.0),
             create_inc_event("counter-1".into(), 14.0),
@@ -194,10 +193,10 @@ async fn aggregates_batches() {
 async fn doesnt_aggregate_batches() {
     let outputs = send_request(
         indoc! {
-            r#"
+            r"
             batch.max_events = 3
             batch.aggregate = false
-            "#
+            "
         },
         vec![
             create_inc_event("counter-1".into(), 12.0),
@@ -231,11 +230,11 @@ async fn doesnt_aggregate_batches() {
 
 async fn send_request(config: &str, events: Vec<Event>) -> Vec<(HeaderMap, proto::WriteRequest)> {
     assert_sink_compliance(&HTTP_SINK_TAGS, async {
-        let addr = test_util::next_addr();
+        let (_guard, addr) = test_util::addr::next_addr();
         let (rx, trigger, server) = build_test_server(addr);
         tokio::spawn(server);
 
-        let config = format!("endpoint = \"http://{}/write\"\n{}", addr, config);
+        let config = format!("endpoint = \"http://{addr}/write\"\n{config}");
         let config: RemoteWriteConfig = toml::from_str(&config).unwrap();
         let cx = SinkContext::default();
 

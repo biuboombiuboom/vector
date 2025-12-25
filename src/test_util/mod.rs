@@ -1,27 +1,27 @@
 #![allow(missing_docs)]
+
 use std::{
     collections::HashMap,
     convert::Infallible,
     fs::File,
-    future::{ready, Future},
+    future::{Future, ready},
     io::Read,
     iter,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
-use chrono::{SubsecRound, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use flate2::read::MultiGzDecoder;
-use futures::{stream, task::noop_waker_ref, FutureExt, SinkExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, SinkExt, Stream, StreamExt, TryStreamExt, stream, task::noop_waker_ref};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
-use portpicker::pick_unused_port;
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 use rand_distr::Alphanumeric;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, Result as IoResult},
@@ -29,16 +29,18 @@ use tokio::{
     runtime,
     sync::oneshot,
     task::JoinHandle,
-    time::{sleep, Duration, Instant},
+    time::{Duration, Instant, sleep},
 };
 use tokio_stream::wrappers::TcpListenerStream;
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::codec::{Encoder, FramedRead, FramedWrite, LinesCodec};
-use vector_lib::event::{BatchNotifier, Event, EventArray, LogEvent, MetricTags, MetricValue};
 use vector_lib::{
     buffers::topology::channel::LimitedReceiver,
-    event::{Metric, MetricKind},
+    event::{
+        BatchNotifier, BatchStatusReceiver, Event, EventArray, LogEvent, Metric, MetricKind,
+        MetricTags, MetricValue,
+    },
 };
 #[cfg(test)]
 use zstd::Decoder as ZstdDecoder;
@@ -53,23 +55,24 @@ const WAIT_FOR_SECS: u64 = 5; // The default time to wait in `wait_for`
 const WAIT_FOR_MIN_MILLIS: u64 = 5; // The minimum time to pause before retrying
 const WAIT_FOR_MAX_MILLIS: u64 = 500; // The maximum time to pause before retrying
 
+pub mod addr;
+pub mod compression;
+pub mod stats;
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod components;
-
 #[cfg(test)]
 pub mod http;
-
+#[cfg(test)]
+pub mod integration;
 #[cfg(test)]
 pub mod metrics;
-
 #[cfg(test)]
 pub mod mock;
 
-pub mod stats;
-
 #[macro_export]
 macro_rules! assert_downcast_matches {
-    ($e:expr, $t:ty, $v:pat) => {{
+    ($e:expr_2021, $t:ty, $v:pat) => {{
         match $e.downcast_ref::<$t>() {
             Some($v) => (),
             got => panic!("Assertion failed: got wrong error variant {:?}", got),
@@ -79,7 +82,7 @@ macro_rules! assert_downcast_matches {
 
 #[macro_export]
 macro_rules! log_event {
-    ($($key:expr => $value:expr),*  $(,)?) => {
+    ($($key:expr_2021 => $value:expr_2021),*  $(,)?) => {
         #[allow(unused_variables)]
         {
             let mut event = $crate::event::Event::Log($crate::event::LogEvent::default());
@@ -99,29 +102,13 @@ where
     let cfg = toml::to_string(&T::generate_config()).unwrap();
 
     toml::from_str::<T>(&cfg)
-        .unwrap_or_else(|e| panic!("Invalid config generated from string:\n\n{}\n'{}'", e, cfg));
+        .unwrap_or_else(|e| panic!("Invalid config generated from string:\n\n{e}\n'{cfg}'"));
 }
 
 pub fn open_fixture(path: impl AsRef<Path>) -> crate::Result<serde_json::Value> {
-    let test_file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) => return Err(e.into()),
-    };
+    let test_file = File::open(path)?;
     let value: serde_json::Value = serde_json::from_reader(test_file)?;
     Ok(value)
-}
-
-pub fn next_addr_for_ip(ip: IpAddr) -> SocketAddr {
-    let port = pick_unused_port(ip);
-    SocketAddr::new(ip, port)
-}
-
-pub fn next_addr() -> SocketAddr {
-    next_addr_for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
-}
-
-pub fn next_addr_v6() -> SocketAddr {
-    next_addr_for_ip(IpAddr::V6(Ipv6Addr::LOCALHOST))
 }
 
 pub fn trace_init() {
@@ -129,13 +116,17 @@ pub fn trace_init() {
     let color = {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal()
+            || std::env::var("NEXTEST")
+                .ok()
+                .and(Some(true))
+                .unwrap_or(false)
     };
     // Windows: ANSI colors are not supported by cmd.exe
     // Color is false for everything except unix.
     #[cfg(not(unix))]
     let color = false;
 
-    let levels = std::env::var("TEST_LOG").unwrap_or_else(|_| "error".to_string());
+    let levels = std::env::var("VECTOR_LOG").unwrap_or_else(|_| "error".to_string());
 
     trace::init(color, false, &levels, 10);
 
@@ -231,6 +222,10 @@ pub fn temp_dir() -> PathBuf {
     path.join(dir_name)
 }
 
+pub fn random_table_name() -> String {
+    format!("test_{}", random_string(10).to_lowercase())
+}
+
 pub fn map_event_batch_stream(
     stream: impl Stream<Item = Event>,
     batch: Option<BatchNotifier>,
@@ -286,13 +281,39 @@ pub fn random_metrics_with_stream(
     batch: Option<BatchNotifier>,
     tags: Option<MetricTags>,
 ) -> (Vec<Event>, impl Stream<Item = EventArray>) {
-    let timestamp = Utc::now().trunc_subsecs(3);
+    random_metrics_with_stream_timestamp(
+        count,
+        batch,
+        tags,
+        Utc::now().trunc_subsecs(3),
+        std::time::Duration::from_secs(2),
+    )
+}
+
+/// Generates event metrics with the provided tags and timestamp.
+///
+/// # Parameters
+/// - `count`: the number of metrics to generate
+/// - `batch`: the batch notifier to use with the stream
+/// - `tags`: the tags to apply to each metric event
+/// - `timestamp`: the timestamp to use for each metric event
+/// - `timestamp_offset`: the offset from the `timestamp` to use for each additional metric
+///
+/// # Returns
+/// A tuple of the generated metric events and the stream of the generated events
+pub fn random_metrics_with_stream_timestamp(
+    count: usize,
+    batch: Option<BatchNotifier>,
+    tags: Option<MetricTags>,
+    timestamp: DateTime<Utc>,
+    timestamp_offset: std::time::Duration,
+) -> (Vec<Event>, impl Stream<Item = EventArray>) {
     let events: Vec<_> = (0..count)
         .map(|index| {
-            let ts = timestamp + (std::time::Duration::from_secs(2) * index as u32);
+            let ts = timestamp + (timestamp_offset * index as u32);
             Event::Metric(
                 Metric::new(
-                    format!("counter_{}", thread_rng().gen::<u32>()),
+                    format!("counter_{}", rng().random::<u32>()),
                     MetricKind::Incremental,
                     MetricValue::Counter {
                         value: index as f64,
@@ -347,8 +368,19 @@ where
     (events, stream)
 }
 
+pub fn create_events_batch_with_fn<F: Fn() -> Event>(
+    create_event_fn: F,
+    num_events: usize,
+) -> (Vec<Event>, BatchStatusReceiver) {
+    let mut events = (0..num_events)
+        .map(|_| create_event_fn())
+        .collect::<Vec<_>>();
+    let receiver = BatchNotifier::apply_to(&mut events);
+    (events, receiver)
+}
+
 pub fn random_string(len: usize) -> String {
-    thread_rng()
+    rng()
         .sample_iter(&Alphanumeric)
         .take(len)
         .map(char::from)
@@ -360,7 +392,7 @@ pub fn random_lines(len: usize) -> impl Iterator<Item = String> {
 }
 
 pub fn random_map(max_size: usize, field_len: usize) -> HashMap<String, String> {
-    let size = thread_rng().gen_range(0..max_size);
+    let size = rng().random_range(0..max_size);
 
     (0..size)
         .map(move |_| (random_string(field_len), random_string(field_len)))

@@ -1,8 +1,13 @@
-use std::collections::BTreeMap;
-use std::ops::{Deref, DerefMut};
-use vrl::diagnostic::Label;
-use vrl::path::{OwnedTargetPath, PathPrefix};
-use vrl::prelude::*;
+use std::{
+    collections::BTreeMap,
+    ops::{Deref, DerefMut},
+};
+
+use vrl::{
+    diagnostic::Label,
+    path::{OwnedTargetPath, PathPrefix},
+    prelude::*,
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct MeaningList(pub BTreeMap<String, OwnedTargetPath>);
@@ -45,11 +50,11 @@ impl Function for SetSemanticMeaning {
     }
 
     fn examples(&self) -> &'static [Example] {
-        &[Example {
+        &[example!(
             title: "Sets custom field semantic meaning",
             source: r#"set_semantic_meaning(.foo, "bar")"#,
             result: Ok("null"),
-        }]
+        )]
     }
 
     fn compile(
@@ -163,6 +168,6 @@ impl FunctionExpression for SetSemanticMeaningFn {
     }
 
     fn type_def(&self, _: &TypeState) -> TypeDef {
-        TypeDef::null().infallible()
+        TypeDef::null().infallible().impure()
     }
 }

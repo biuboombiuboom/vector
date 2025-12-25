@@ -1,38 +1,50 @@
 use std::{
-    collections::HashMap, convert::TryFrom, future::ready, pin::Pin, sync::Arc, time::Duration,
+    collections::HashMap,
+    convert::TryFrom,
+    future::ready,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use bollard::{
-    container::{InspectContainerOptions, ListContainersOptions, LogOutput, LogsOptions},
-    errors::Error as DockerError,
-    service::{ContainerInspectResponse, EventMessage},
-    system::EventsOptions,
     Docker,
+    container::LogOutput,
+    errors::Error as DockerError,
+    query_parameters::{
+        EventsOptionsBuilder, InspectContainerOptions, ListContainersOptionsBuilder,
+        LogsOptionsBuilder,
+    },
+    service::{ContainerInspectResponse, EventMessage},
 };
 use bytes::{Buf, Bytes};
 use chrono::{DateTime, FixedOffset, Local, ParseError, Utc};
 use futures::{Stream, StreamExt};
-use once_cell::sync::Lazy;
 use serde_with::serde_as;
 use tokio::sync::mpsc;
 use tracing_futures::Instrument;
-use vector_lib::codecs::{BytesDeserializer, BytesDeserializerConfig};
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::configurable::configurable_component;
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, InternalEventHandle as _, Protocol, Registered,
+use vector_lib::{
+    codecs::{BytesDeserializer, BytesDeserializerConfig},
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol, Registered},
+    lookup::{
+        OwnedValuePath, PathPrefix, lookup_v2::OptionalValuePath, metadata_path, owned_value_path,
+        path,
+    },
 };
-use vector_lib::lookup::{
-    lookup_v2::OptionalValuePath, metadata_path, owned_value_path, path, OwnedValuePath, PathPrefix,
+use vrl::{
+    event_path,
+    value::{Kind, kind::Collection},
 };
-use vrl::event_path;
-use vrl::value::{kind::Collection, Kind};
 
 use super::util::MultilineConfig;
 use crate::{
-    config::{log_schema, DataType, SourceConfig, SourceContext, SourceOutput},
-    docker::{docker, DockerTlsConfig},
-    event::{self, merge_state::LogEventMergeState, EstimatedJsonEncodedSizeOf, LogEvent, Value},
+    SourceSender,
+    common::backoff::ExponentialBackoff,
+    config::{DataType, SourceConfig, SourceContext, SourceOutput, log_schema},
+    docker::{DockerTlsConfig, docker},
+    event::{self, EstimatedJsonEncodedSizeOf, LogEvent, Value, merge_state::LogEventMergeState},
     internal_events::{
         DockerLogsCommunicationError, DockerLogsContainerEventReceived,
         DockerLogsContainerMetadataFetchError, DockerLogsContainerUnwatch,
@@ -41,7 +53,6 @@ use crate::{
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
-    SourceSender,
 };
 
 #[cfg(test)]
@@ -55,9 +66,9 @@ const CONTAINER: &str = "container_id";
 // Prevent short hostname from being wrongly recognized as a container's short ID.
 const MIN_HOSTNAME_LENGTH: usize = 6;
 
-static STDERR: Lazy<Bytes> = Lazy::new(|| "stderr".into());
-static STDOUT: Lazy<Bytes> = Lazy::new(|| "stdout".into());
-static CONSOLE: Lazy<Bytes> = Lazy::new(|| "console".into());
+static STDERR: LazyLock<Bytes> = LazyLock::new(|| "stderr".into());
+static STDOUT: LazyLock<Bytes> = LazyLock::new(|| "stdout".into());
+static CONSOLE: LazyLock<Bytes> = LazyLock::new(|| "console".into());
 
 /// Configuration for the `docker_logs` source.
 #[serde_as]
@@ -70,8 +81,7 @@ pub struct DockerLogsConfig {
     /// By default, the [global `log_schema.host_key` option][global_host_key] is used.
     ///
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
-    #[serde(default = "default_host_key")]
-    host_key: OptionalValuePath,
+    host_key: Option<OptionalValuePath>,
 
     /// Docker host to connect to.
     ///
@@ -171,7 +181,7 @@ pub struct DockerLogsConfig {
 impl Default for DockerLogsConfig {
     fn default() -> Self {
         Self {
-            host_key: default_host_key(),
+            host_key: None,
             docker_host: None,
             tls: None,
             exclude_containers: None,
@@ -185,10 +195,6 @@ impl Default for DockerLogsConfig {
             log_namespace: None,
         }
     }
-}
-
-fn default_host_key() -> OptionalValuePath {
-    log_schema().host_key().cloned().into()
 }
 
 fn default_partial_event_marker_field() -> Option<String> {
@@ -226,10 +232,10 @@ impl DockerLogsConfig {
     }
 
     fn with_empty_partial_event_marker_field_as_none(mut self) -> Self {
-        if let Some(val) = &self.partial_event_marker_field {
-            if val.is_empty() {
-                self.partial_event_marker_field = None;
-            }
+        if let Some(val) = &self.partial_event_marker_field
+            && val.is_empty()
+        {
+            self.partial_event_marker_field = None;
         }
         self
     }
@@ -256,7 +262,7 @@ impl SourceConfig for DockerLogsConfig {
                 Err(error) => {
                     error!(
                         message = "Listing currently running containers failed.",
-                        %error
+                        ?error
                     );
                 }
             }
@@ -273,7 +279,12 @@ impl SourceConfig for DockerLogsConfig {
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
-        let host_key = self.host_key.clone().path.map(LegacyKey::Overwrite);
+        let host_key = self
+            .host_key
+            .clone()
+            .unwrap_or(log_schema().host_key().cloned().into())
+            .path
+            .map(LegacyKey::Overwrite);
 
         let schema_definition = BytesDeserializerConfig
             .schema_definition(global_log_namespace.merge(self.log_namespace))
@@ -349,7 +360,10 @@ impl SourceConfig for DockerLogsConfig {
                 None,
             );
 
-        vec![SourceOutput::new_logs(DataType::Log, schema_definition)]
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
     }
 
     fn can_acknowledge(&self) -> bool {
@@ -395,7 +409,7 @@ impl DockerLogsSourceCore {
     /// Returns event stream coming from docker.
     fn docker_logs_event_stream(
         &self,
-    ) -> impl Stream<Item = Result<EventMessage, DockerError>> + Send {
+    ) -> impl Stream<Item = Result<EventMessage, DockerError>> + Send + use<> {
         let mut filters = HashMap::new();
 
         // event  | emitted on commands
@@ -424,11 +438,12 @@ impl DockerLogsSourceCore {
             filters.insert("image".to_owned(), include_images.clone());
         }
 
-        self.docker.events(Some(EventsOptions {
-            since: Some(self.now_timestamp),
-            until: None,
-            filters,
-        }))
+        self.docker.events(Some(
+            EventsOptionsBuilder::new()
+                .since(&self.now_timestamp.timestamp().to_string())
+                .filters(&filters)
+                .build(),
+        ))
     }
 }
 
@@ -454,6 +469,8 @@ struct DockerLogsSource {
     /// It may contain shortened container id.
     hostname: Option<String>,
     backoff_duration: Duration,
+    /// Backoff strategy for events stream retries
+    events_backoff: ExponentialBackoff,
 }
 
 impl DockerLogsSource {
@@ -465,7 +482,10 @@ impl DockerLogsSource {
     ) -> crate::Result<DockerLogsSource> {
         let backoff_secs = config.retry_backoff_secs;
 
-        let host_key = config.host_key.clone();
+        let host_key = config
+            .host_key
+            .clone()
+            .unwrap_or(log_schema().host_key().cloned().into());
         let hostname = crate::get_hostname().ok();
 
         // Only logs created at, or after this moment are logged.
@@ -504,6 +524,7 @@ impl DockerLogsSource {
             main_recv,
             hostname,
             backoff_duration: backoff_secs,
+            events_backoff: ExponentialBackoff::default(),
         })
     }
 
@@ -523,11 +544,12 @@ impl DockerLogsSource {
         self.esb
             .core
             .docker
-            .list_containers(Some(ListContainersOptions {
-                all: false, // only running containers
-                filters,
-                ..Default::default()
-            }))
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new()
+                    .all(false)
+                    .filters(&filters)
+                    .build(),
+            ))
             .await?
             .into_iter()
             .for_each(|container| {
@@ -593,7 +615,7 @@ impl DockerLogsSource {
                             }
                         }
                         None => {
-                            error!(message = "The docker_logs source main stream has ended unexpectedly.");
+                            error!(message = "The docker_logs source main stream has ended unexpectedly.", internal_log_rate_limit = false);
                             info!(message = "Shutting down docker_logs source.");
                             return;
                         }
@@ -602,6 +624,9 @@ impl DockerLogsSource {
                 value = self.events.next() => {
                     match value {
                         Some(Ok(mut event)) => {
+                            // Reset backoff on successful event
+                            self.events_backoff.reset();
+
                             let action = event.action.unwrap();
                             let actor = event.actor.take().unwrap();
                             let id = actor.id.unwrap();
@@ -644,17 +669,47 @@ impl DockerLogsSource {
                                 error,
                                 container_id: None,
                             });
-                            return;
+                            // Retry events stream with exponential backoff
+                            if !self.retry_events_stream_with_backoff("Docker events stream failed").await {
+                                error!("Docker events stream failed and retry exhausted, shutting down.");
+                                return;
+                            }
                         },
                         None => {
-                            // TODO: this could be fixed, but should be tried with some timeoff and exponential backoff
-                            error!(message = "Docker log event stream has ended unexpectedly.");
-                            info!(message = "Shutting down docker_logs source.");
-                            return;
+                            // Retry events stream with exponential backoff
+                            if !self.retry_events_stream_with_backoff("Docker events stream ended").await {
+                                error!("Docker events stream ended and retry exhausted, shutting down.");
+                                return;
+                            }
                         }
                     };
                 }
             };
+        }
+    }
+
+    /// Retry events stream with exponential backoff
+    /// Returns true if retry was attempted, false if exhausted or shutdown
+    async fn retry_events_stream_with_backoff(&mut self, reason: &str) -> bool {
+        if let Some(delay) = self.events_backoff.next() {
+            warn!(
+                message = reason,
+                action = "retrying with backoff",
+                delay_ms = delay.as_millis()
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {
+                    self.events = Box::pin(self.esb.core.docker_logs_event_stream());
+                    true
+                }
+                _ = self.esb.shutdown.clone() => {
+                    info!("Shutdown signal received during retry backoff.");
+                    false
+                }
+            }
+        } else {
+            error!(message = "Events stream retry exhausted.", reason = reason);
+            false
         }
     }
 
@@ -732,14 +787,15 @@ impl EventStreamBuilder {
 
     async fn run_event_stream(mut self, mut info: ContainerLogInfo) {
         // Establish connection
-        let options = Some(LogsOptions::<String> {
-            follow: true,
-            stdout: true,
-            stderr: true,
-            since: info.log_since(),
-            timestamps: true,
-            ..Default::default()
-        });
+        let options = Some(
+            LogsOptionsBuilder::new()
+                .follow(true)
+                .stdout(true)
+                .stderr(true)
+                .since(info.log_since() as i32) // 2038 bug (I think)
+                .timestamps(true)
+                .build(),
+        );
 
         let stream = self.core.docker.logs(info.id.as_str(), options);
         emit!(DockerLogsContainerWatch {
@@ -900,12 +956,12 @@ impl ContainerState {
         }
     }
 
-    fn running(&mut self) {
+    const fn running(&mut self) {
         self.running = true;
         self.generation += 1;
     }
 
-    fn stopped(&mut self) {
+    const fn stopped(&mut self) {
         self.running = false;
     }
 
@@ -997,8 +1053,9 @@ impl ContainerLogInfo {
                 // occur when a container changes generations, and to avoid processing logs with timestamps before
                 // the created timestamp.
                 match self.last_log.as_ref() {
-                    Some(&(last, gen)) => {
-                        if last < timestamp || (last == timestamp && gen == self.generation) {
+                    Some(&(last, generation)) => {
+                        if last < timestamp || (last == timestamp && generation == self.generation)
+                        {
                             // Noop - log received in order.
                         } else {
                             // Docker returns logs in order.
@@ -1148,10 +1205,10 @@ impl ContainerLogInfo {
                 log.insert(metadata_path!("vector", "ingest_timestamp"), Utc::now());
             }
             LogNamespace::Legacy => {
-                if let Some(timestamp) = timestamp {
-                    if let Some(timestamp_key) = log_schema().timestamp_key() {
-                        log.try_insert((PathPrefix::Event, timestamp_key), timestamp);
-                    }
+                if let Some(timestamp) = timestamp
+                    && let Some(timestamp_key) = log_schema().timestamp_key()
+                {
+                    log.try_insert((PathPrefix::Event, timestamp_key), timestamp);
                 }
             }
         };
@@ -1271,7 +1328,7 @@ impl ContainerMetadata {
             name: name.as_str().trim_start_matches('/').to_owned().into(),
             name_str: name,
             image: config.image.unwrap().into(),
-            created_at: DateTime::parse_from_rfc3339(created.as_str())?.with_timezone(&Utc),
+            created_at: created.with_timezone(&Utc),
         })
     }
 }

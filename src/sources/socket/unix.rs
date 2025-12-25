@@ -2,24 +2,25 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use chrono::Utc;
-use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::{lookup_v2::OptionalValuePath, path};
-use vector_lib::shutdown::ShutdownSignal;
+use vector_lib::{
+    codecs::decoding::{DeserializerConfig, FramingConfig},
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    lookup::{lookup_v2::OptionalValuePath, path},
+    shutdown::ShutdownSignal,
+};
 
+use super::{SocketConfig, default_host_key};
 use crate::{
+    SourceSender,
     codecs::Decoder,
     event::Event,
     serde::default_decoding,
     sources::{
-        util::{build_unix_datagram_source, build_unix_stream_source},
         Source,
+        util::{build_unix_datagram_source, build_unix_stream_source},
     },
-    SourceSender,
 };
-
-use super::{default_host_key, SocketConfig};
 
 /// Unix domain socket configuration for the `socket` source.
 #[configurable_component]
@@ -99,20 +100,20 @@ fn handle_events(
     let now = Utc::now();
 
     for event in events {
-        let log = event.as_mut_log();
+        if let Event::Log(log) = event {
+            log_namespace.insert_standard_vector_source_metadata(log, SocketConfig::NAME, now);
 
-        log_namespace.insert_standard_vector_source_metadata(log, SocketConfig::NAME, now);
+            if let Some(ref host) = received_from {
+                let legacy_host_key = host_key.clone().path;
 
-        if let Some(ref host) = received_from {
-            let legacy_host_key = host_key.clone().path;
-
-            log_namespace.insert_source_metadata(
-                SocketConfig::NAME,
-                log,
-                legacy_host_key.as_ref().map(LegacyKey::InsertIfEmpty),
-                path!("host"),
-                host.clone(),
-            );
+                log_namespace.insert_source_metadata(
+                    SocketConfig::NAME,
+                    log,
+                    legacy_host_key.as_ref().map(LegacyKey::InsertIfEmpty),
+                    path!("host"),
+                    host.clone(),
+                );
+            }
         }
     }
 }

@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
-use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 
 // Environment variable names can have any characters from the Portable Character Set other
@@ -10,7 +9,7 @@ use regex::{Captures, Regex};
 // variable names when they come from a Java properties file.
 //
 // https://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap08.html
-pub static ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX: Lazy<Regex> = Lazy::new(|| {
+pub static ENVIRONMENT_VARIABLE_INTERPOLATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)
         \$\$|
@@ -32,7 +31,18 @@ pub fn interpolate(input: &str, vars: &HashMap<String, String>) -> Result<String
                 .or_else(|| caps.get(2))
                 .map(|m| m.as_str())
                 .map(|name| {
-                    let val = vars.get(name).map(|v| v.as_str());
+                    // Get the value and check for newlines (LF or CR)
+                    let val = vars.get(name).and_then(|v| {
+                        if v.contains(['\n', '\r']) {
+                            errors.push(format!(
+                                "Environment variable contains newline character. name = {name:?}",
+                            ));
+                            None
+                        } else {
+                            Some(v.as_str())
+                        }
+                    });
+
                     match flags {
                         ":-" => match val {
                             Some(v) if !v.is_empty() => v,
@@ -118,5 +128,44 @@ mod test {
         assert!(interpolate("${NOT:?error cats}", &vars).is_err());
         assert!(interpolate("${NOT?error cats}", &vars).is_err());
         assert!(interpolate("${EMPTY:?error cats}", &vars).is_err());
+    }
+
+    #[test]
+    fn test_multiline_expansion_prevented() {
+        let vars = vec![
+            ("SAFE_VAR".into(), "single line value".into()),
+            ("MULTILINE_VAR".into(), "line1\nline2\nline3".into()),
+            ("WITH_NEWLINE".into(), "before\nafter".into()),
+            ("WITH_CR".into(), "before\rafter".into()),
+            ("WITH_CRLF".into(), "before\r\nafter".into()),
+        ]
+        .into_iter()
+        .collect();
+
+        // Test that multiline values are treated as missing
+        let result = interpolate("$MULTILINE_VAR", &vars);
+        assert!(result.is_err(), "Multiline var should be rejected");
+
+        let result = interpolate("$WITH_NEWLINE", &vars);
+        assert!(result.is_err(), "Newline var should be rejected");
+
+        let result = interpolate("$WITH_CR", &vars);
+        assert!(result.is_err(), "CR var should be rejected");
+
+        let result = interpolate("$WITH_CRLF", &vars);
+        assert!(result.is_err(), "CRLF var should be rejected");
+
+        // Test that safe values still work
+        let result = interpolate("$SAFE_VAR", &vars).unwrap();
+        assert_eq!("single line value", result);
+
+        // Test with default values - multiline vars should still error
+        let result = interpolate("${MULTILINE_VAR:-safe default}", &vars);
+        assert!(result.is_err(), "Should error even with default");
+
+        // Verify error messages are helpful
+        let err = interpolate("$MULTILINE_VAR", &vars).unwrap_err();
+        assert!(err.iter().any(|e| e.contains("newline character")));
+        assert!(err.iter().any(|e| e.contains("MULTILINE_VAR")));
     }
 }

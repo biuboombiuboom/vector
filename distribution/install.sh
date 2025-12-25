@@ -13,7 +13,7 @@ set -u
 # If PACKAGE_ROOT is unset or empty, default it.
 PACKAGE_ROOT="${PACKAGE_ROOT:-"https://packages.timber.io/vector"}"
 # If VECTOR_VERSION is unset or empty, default it.
-VECTOR_VERSION="${VECTOR_VERSION:-"0.38.0"}"
+VECTOR_VERSION="${VECTOR_VERSION:-"0.52.0"}"
 _divider="--------------------------------------------------------------------------------"
 _prompt=">>>"
 _indent="   "
@@ -144,24 +144,14 @@ install_from_archive() {
     local _archive_arch=""
 
     case "$_arch" in
-        x86_64-apple-darwin)
-            _archive_arch=$_arch
+        aarch64-apple-darwin)
+            _archive_arch="arm64-apple-darwin"
             ;;
         x86_64-*linux*-gnu)
             _archive_arch="x86_64-unknown-linux-gnu"
             ;;
         x86_64-*linux*-musl)
             _archive_arch="x86_64-unknown-linux-musl"
-            ;;
-        aarch64-apple-darwin)
-            # This if statement can be removed when Vector publishes aarch64-apple-darwin builds
-            if /usr/bin/pgrep oahd >/dev/null 2>&1; then
-                echo "Rosetta is installed, installing x86_64-apple-darwin archive"
-                _archive_arch="x86_64-apple-darwin"
-            else
-                echo "Builds for Apple Silicon are not published today, please install Rosetta"
-                err "unsupported arch: $_arch"
-            fi
             ;;
         aarch64-*linux*)
             _archive_arch="aarch64-unknown-linux-musl"
@@ -205,7 +195,9 @@ install_from_archive() {
         ensure tar -xzf "$_file" --directory="$_unpack_dir" --strip-components=2
         # copy all files (including hidden), ref: https://askubuntu.com/a/86891
         ensure cp -r "$_unpack_dir/bin/." "$prefix/bin"
-        ensure cp -r "$_unpack_dir/etc/." "$prefix/etc"
+        if [ -d "$_unpack_dir/etc/." ]; then
+          ensure cp -r "$_unpack_dir/etc/." "$prefix/etc"
+        fi
         ensure mkdir -p "$prefix/share/vector/config"
         ensure cp -r "$_unpack_dir/config/." "$prefix/share/vector/config"
         ensure cp "$_unpack_dir"/README.md "$prefix/share/vector/"
@@ -461,19 +453,6 @@ get_architecture() {
                 _cputype=$(get_endianness mips64 '' el)
             fi
             ;;
-
-        ppc)
-            _cputype=powerpc
-            ;;
-
-        ppc64)
-            _cputype=powerpc64
-            ;;
-
-        ppc64le)
-            _cputype=powerpc64le
-            ;;
-
         s390x)
             _cputype=s390x
             ;;
@@ -510,9 +489,6 @@ get_architecture() {
                 ;;
             mips64)
                 _cputype=$(get_endianness mips '' el)
-                ;;
-            powerpc64)
-                _cputype=powerpc
                 ;;
             aarch64)
                 _cputype=armv7
@@ -599,21 +575,25 @@ downloader() {
     if [ "$1" = --check ]; then
         need_cmd "$_dld"
     elif [ "$_dld" = curl ]; then
-        check_curl_for_retry_support
-        _retry="$RETVAL"
+        if check_curl_for_retry_support; then
+          _retry=(--retry 3)
+        else
+          _retry=()
+        fi
+
         get_ciphersuites_for_curl
         _ciphersuites="$RETVAL"
         if [ -n "$_ciphersuites" ]; then
-            _err=$(curl $_retry --proto '=https' --tlsv1.2 --ciphers "$_ciphersuites" --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+            _err=$(curl "${_retry[@]}" --proto '=https' --tlsv1.2 --ciphers "$_ciphersuites" --silent --show-error --fail --location "$1" --output "$2" 2>&1)
             _status=$?
         else
             echo "Warning: Not enforcing strong cipher suites for TLS, this is potentially less secure"
             if ! check_help_for "$3" curl --proto --tlsv1.2; then
                 echo "Warning: Not enforcing TLS v1.2, this is potentially less secure"
-                _err=$(curl $_retry --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+                _err=$(curl "${_retry[@]}" --silent --show-error --fail --location "$1" --output "$2" 2>&1)
                 _status=$?
             else
-                _err=$(curl $_retry --proto '=https' --tlsv1.2 --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+                _err=$(curl "${_retry[@]}" --proto '=https' --tlsv1.2 --silent --show-error --fail --location "$1" --output "$2" 2>&1)
                 _status=$?
             fi
         fi
@@ -712,16 +692,13 @@ check_help_for() {
     true # not strictly needed
 }
 
-# Check if curl supports the --retry flag, then pass it to the curl invocation.
+# Check if curl supports the --retry flag
 check_curl_for_retry_support() {
-  local _retry_supported=""
-  # "unspecified" is for arch, allows for possibility old OS using macports, homebrew, etc.
   if check_help_for "notspecified" "curl" "--retry"; then
-    _retry_supported="--retry 3"
+    return 0
+  else
+    return 1
   fi
-
-  RETVAL="$_retry_supported"
-
 }
 
 # Return cipher suite string specified by user, otherwise return strong TLS 1.2-1.3 cipher suites

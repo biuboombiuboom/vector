@@ -1,19 +1,19 @@
 use darling::{
-    util::{Flag, Override, SpannedValue},
     FromAttributes,
+    util::{Flag, Override, SpannedValue},
 };
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
 use serde_derive_internals::ast as serde_ast;
-use syn::{parse_quote, ExprPath, Ident};
-use vector_config_common::{configurable_package_name_hack, validation::Validation};
+use syn::{ExprPath, Ident, parse_quote};
+use vector_config_common::validation::Validation;
 
 use super::{
+    LazyCustomAttribute, Metadata,
     util::{
         err_field_implicit_transparent, err_field_missing_description,
         find_delegated_serde_deser_ty, get_serde_default_value, try_extract_doc_title_description,
     },
-    LazyCustomAttribute, Metadata,
 };
 
 /// A field of a container.
@@ -240,7 +240,7 @@ impl<'a> Field<'a> {
     }
 }
 
-impl<'a> ToTokens for Field<'a> {
+impl ToTokens for Field<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.original.to_tokens(tokens)
     }
@@ -352,8 +352,7 @@ impl Attributes {
             // serialize wrapper, since we know we'll have to do that in a few different places
             // during codegen, so it's cleaner to do it here.
             let field_ty = field.ty;
-            let vector_config = configurable_package_name_hack();
-            parse_quote! { #vector_config::ser::Delegated<#field_ty, #virtual_ty> }
+            parse_quote! { ::vector_config::ser::Delegated<#field_ty, #virtual_ty> }
         });
 
         Ok(self)

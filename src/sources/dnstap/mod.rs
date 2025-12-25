@@ -1,37 +1,39 @@
 use std::path::PathBuf;
 
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use dnsmsg_parser::dns_message_parser::DnsParserOptions;
-use vector_lib::event::{Event, LogEvent};
-use vector_lib::internal_event::{
-    ByteSize, BytesReceived, InternalEventHandle, Protocol, Registered,
+use dnstap_parser::{
+    parser::DnstapParser,
+    schema::{DNSTAP_VALUE_PATHS, DnstapEventSchema},
 };
-use vector_lib::lookup::{owned_value_path, path};
-use vector_lib::{configurable::configurable_component, tls::MaybeTlsSettings};
-use vrl::path::{OwnedValuePath, PathPrefix};
-use vrl::value::{kind::Collection, Kind};
-
-use self::parser::DnstapParser;
+use vector_lib::{
+    configurable::configurable_component,
+    event::{Event, LogEvent},
+    internal_event::{ByteSize, BytesReceived, InternalEventHandle, Protocol, Registered},
+    lookup::{owned_value_path, path},
+    tls::MaybeTlsSettings,
+};
+use vrl::{
+    path::{OwnedValuePath, PathPrefix},
+    value::{Kind, kind::Collection},
+};
 
 use super::util::framestream::{
-    build_framestream_tcp_source, build_framestream_unix_source, FrameHandler,
+    FrameHandler, build_framestream_tcp_source, build_framestream_unix_source,
 };
-use crate::internal_events::DnstapParseError;
-use crate::sources::dnstap::schema::DNSTAP_VALUE_PATHS;
 use crate::{
-    config::{log_schema, DataType, SourceConfig, SourceContext, SourceOutput},
     Result,
+    config::{DataType, SourceConfig, SourceContext, SourceOutput, log_schema},
+    internal_events::DnstapParseError,
 };
 
-pub mod parser;
-pub mod schema;
 pub mod tcp;
 #[cfg(unix)]
 pub mod unix;
-use dnsmsg_parser::{dns_message, dns_message_parser};
-pub use schema::DnstapEventSchema;
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::lookup::lookup_v2::OptionalValuePath;
+use vector_lib::{
+    config::{LegacyKey, LogNamespace},
+    lookup::lookup_v2::OptionalValuePath,
+};
 
 /// Configuration for the `dnstap` source.
 #[configurable_component(source("dnstap", "Collect DNS logs from a dnstap-compatible server."))]
@@ -66,7 +68,7 @@ pub struct DnstapConfig {
     pub multithreaded: Option<bool>,
 
     /// Maximum number of frames that can be processed concurrently.
-    pub max_frame_handling_tasks: Option<u32>,
+    pub max_frame_handling_tasks: Option<usize>,
 
     /// Whether to downcase all DNSTAP hostnames received for consistency
     #[serde(default = "crate::serde::default_false")]
@@ -120,14 +122,10 @@ impl DnstapConfig {
             LogNamespace::Legacy => {
                 let schema = vector_lib::schema::Definition::empty_legacy_namespace();
 
-                if self.raw_data_only() {
-                    if let Some(message_key) = log_schema().message_key() {
-                        return schema.with_event_field(
-                            message_key,
-                            Kind::bytes(),
-                            Some("message"),
-                        );
-                    }
+                if self.raw_data_only()
+                    && let Some(message_key) = log_schema().message_key()
+                {
+                    return schema.with_event_field(message_key, Kind::bytes(), Some("message"));
                 }
                 event_schema.schema_definition(schema)
             }
@@ -185,7 +183,7 @@ impl SourceConfig for DnstapConfig {
             Mode::Tcp(config) => {
                 let tls_config = config.tls().as_ref().map(|tls| tls.tls_config.clone());
 
-                let tls = MaybeTlsSettings::from_config(&tls_config, true)?;
+                let tls = MaybeTlsSettings::from_config(tls_config.as_ref(), true)?;
                 let frame_handler = tcp::DnstapFrameHandler::new(
                     config.clone(),
                     tls,
@@ -209,7 +207,10 @@ impl SourceConfig for DnstapConfig {
         let schema_definition = self
             .schema_definition(log_namespace)
             .with_standard_vector_source_metadata();
-        vec![SourceOutput::new_logs(DataType::Log, schema_definition)]
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
     }
 
     fn can_acknowledge(&self) -> bool {
@@ -223,7 +224,7 @@ struct CommonFrameHandler {
     content_type: String,
     raw_data_only: bool,
     multithreaded: bool,
-    max_frame_handling_tasks: u32,
+    max_frame_handling_tasks: usize,
     host_key: Option<OwnedValuePath>,
     timestamp_key: Option<OwnedValuePath>,
     source_type_key: Option<OwnedValuePath>,
@@ -299,7 +300,7 @@ impl FrameHandler for CommonFrameHandler {
             },
         ) {
             emit!(DnstapParseError {
-                error: format!("Dnstap protobuf decode error {:?}.", err)
+                error: format!("Dnstap protobuf decode error {err:?}.")
             });
             return None;
         }
@@ -328,7 +329,7 @@ impl FrameHandler for CommonFrameHandler {
         self.multithreaded
     }
 
-    fn max_frame_handling_tasks(&self) -> u32 {
+    fn max_frame_handling_tasks(&self) -> usize {
         self.max_frame_handling_tasks
     }
 
@@ -415,24 +416,24 @@ mod tests {
 mod integration_tests {
     #![allow(clippy::print_stdout)] // tests
 
-    use bollard::exec::{CreateExecOptions, StartExecOptions};
-    use bollard::Docker;
+    use bollard::{
+        Docker,
+        exec::{CreateExecOptions, StartExecOptions},
+    };
     use futures::StreamExt;
     use serde_json::json;
     use tokio::time;
-    use vector_lib::event::Event;
-    use vector_lib::lookup::lookup_v2::OptionalValuePath;
+    use vector_lib::{event::Event, lookup::lookup_v2::OptionalValuePath};
 
     use self::unix::UnixConfig;
-
     use super::*;
     use crate::{
+        SourceSender,
         event::Value,
         test_util::{
-            components::{assert_source_compliance, SOURCE_TAGS},
+            components::{SOURCE_TAGS, assert_source_compliance},
             wait_for,
         },
-        SourceSender,
     };
 
     async fn test_dnstap(raw_data: bool, query_type: &'static str) {
@@ -479,7 +480,7 @@ mod integration_tests {
                         break;
                     }
                     Err(e) => {
-                        println!("Error: {}", e);
+                        println!("Error: {e}");
                         break;
                     }
                 }
@@ -622,7 +623,7 @@ mod integration_tests {
         }
     }
 
-    fn get_bind_ports(raw_data: bool, query_type: &'static str) -> (&str, &str) {
+    fn get_bind_ports(raw_data: bool, query_type: &'static str) -> (&'static str, &'static str) {
         // Returns the query port and control port, respectively, for the given BIND instance.
         match query_type {
             "query" if raw_data => ("8001", "9001"),
@@ -633,7 +634,7 @@ mod integration_tests {
     }
 
     async fn dnstap_exec(cmd: Vec<&str>) {
-        let docker = Docker::connect_with_unix_defaults().expect("failed binding to docker socket");
+        let docker = Docker::connect_with_defaults().expect("failed binding to docker socket");
         let config = CreateExecOptions {
             cmd: Some(cmd),
             attach_stdout: Some(true),
@@ -665,7 +666,7 @@ mod integration_tests {
         dnstap_exec(vec![
             "nslookup",
             "-type=A",
-            format!("-port={}", port).as_str(),
+            format!("-port={port}").as_str(),
             "h1.example.com",
             "localhost",
         ])

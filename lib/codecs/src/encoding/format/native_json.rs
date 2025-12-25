@@ -29,11 +29,6 @@ impl NativeJsonSerializerConfig {
 pub struct NativeJsonSerializer;
 
 impl NativeJsonSerializer {
-    /// Creates a new `NativeJsonSerializer`.
-    pub const fn new() -> Self {
-        Self
-    }
-
     /// Encode event and represent it as native JSON value.
     pub fn to_json_value(&self, event: Event) -> Result<serde_json::Value, vector_common::Error> {
         serde_json::to_value(&event).map_err(|e| e.to_string().into())
@@ -52,8 +47,10 @@ impl Encoder<Event> for NativeJsonSerializer {
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
-    use vector_core::buckets;
-    use vector_core::event::{LogEvent, Metric, MetricKind, MetricValue, Value};
+    use vector_core::{
+        buckets,
+        event::{LogEvent, Metric, MetricKind, MetricValue, Value},
+    };
     use vrl::btreemap;
 
     use super::*;
@@ -63,7 +60,7 @@ mod tests {
         let event = Event::Log(LogEvent::from(btreemap! {
             "foo" => Value::from("bar")
         }));
-        let mut serializer = NativeJsonSerializer::new();
+        let mut serializer = NativeJsonSerializer;
         let mut bytes = BytesMut::new();
 
         serializer.encode(event, &mut bytes).unwrap();
@@ -76,7 +73,7 @@ mod tests {
         let event = Event::Log(LogEvent::from(btreemap! {
             "foo" => Value::from("bar")
         }));
-        let mut serializer = NativeJsonSerializer::new();
+        let mut serializer = NativeJsonSerializer;
         let mut bytes = BytesMut::new();
 
         serializer.encode(event.clone(), &mut bytes).unwrap();
@@ -98,12 +95,14 @@ mod tests {
             },
         ));
 
-        let mut serializer = NativeJsonSerializer::new();
+        let mut serializer = NativeJsonSerializer;
         let mut bytes = BytesMut::new();
         serializer
             .encode(histogram_event.clone(), &mut bytes)
             .unwrap();
-        let json = serializer.to_json_value(histogram_event).unwrap();
-        assert_eq!(bytes.freeze(), serde_json::to_string(&json).unwrap());
+        assert_eq!(
+            bytes.freeze(),
+            serde_json::to_string(&histogram_event).unwrap()
+        );
     }
 }

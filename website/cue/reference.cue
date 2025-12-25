@@ -31,9 +31,10 @@ _values: {
 //
 // * `at_least_once` - The event will be delivered at least once and
 // could be delivered more than once.
+// * `exactly_once` - The event will be delivered exactly once.
 // * `best_effort` - We will make a best effort to deliver the event,
 // but the event is not guaranteed to be delivered.
-#DeliveryStatus: "at_least_once" | "best_effort"
+#DeliveryStatus: "at_least_once" | "exactly_once" | "best_effort"
 
 // `#DeploymentRoles` clarify when a component should be used under
 // certain deployment contexts.
@@ -86,7 +87,8 @@ _values: {
 
 #Event: {
 	{log?: #LogEvent} |
-	{metric?: #MetricEvent}
+	{metric?: #MetricEvent} |
+	{trace?: #TraceEvent}
 }
 
 // `#EventType` represents one of Vector's supported event types.
@@ -150,6 +152,10 @@ _values: {
 }
 
 #LogEvent: {
+	...
+}
+
+#TraceEvent: {
 	...
 }
 
@@ -357,7 +363,6 @@ _values: {
 	"aarch64-unknown-linux-musl":     bool | *true
 	"armv7-unknown-linux-gnueabihf":  bool | *true
 	"armv7-unknown-linux-musleabihf": bool | *true
-	"x86_64-apple-darwin":            bool | *true
 	"x86_64-pc-windows-msv":          bool | *true
 	"x86_64-unknown-linux-gnu":       bool | *true
 	"x86_64-unknown-linux-musl":      bool | *true
@@ -499,6 +504,7 @@ _values: {
 	"string"?: #TypeString & {_args: required: Args.required}
 	"ascii_char"?: #TypeAsciiChar & {_args: required: Args.required}
 	"timestamp"?: #TypeTimestamp & {_args: required: Args.required}
+	"int"?: #TypeInt & {_args: required: Args.required}
 	"uint"?: #TypeUint & {_args: required: Args.required}
 }
 
@@ -616,6 +622,25 @@ _values: {
 	// when examples cannot be derived from the `default` or `enum`
 	// options.
 	examples: [_values.current_timestamp]
+}
+
+#TypeInt: {
+	_args: required: bool
+	let Args = _args
+
+	if !Args.required {
+		// `default` sets the default value.
+		default: int | *null
+	}
+
+	// `examples` clarify values through examples. This should be used
+	// when examples cannot be derived from the `default` or `enum`
+	// options.
+	examples?: [int, ...int]
+
+	// `unit` clarifies the value's unit. While this should be included
+	// as the suffix in the name, this helps to explicitly clarify that.
+	unit?: #Unit | null
 }
 
 #TypeUint: {

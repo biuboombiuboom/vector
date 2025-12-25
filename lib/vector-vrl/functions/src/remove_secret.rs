@@ -1,8 +1,7 @@
 use vrl::prelude::*;
 
 fn remove_secret(ctx: &mut Context, key: Value) -> std::result::Result<Value, ExpressionError> {
-    let key_bytes = key.as_bytes().expect("argument must be a string");
-    let key_str = String::from_utf8_lossy(key_bytes);
+    let key_str = key.as_str().expect("argument must be a string");
     ctx.target_mut().remove_secret(key_str.as_ref());
     Ok(Value::Null)
 }
@@ -24,11 +23,11 @@ impl Function for RemoveSecret {
     }
 
     fn examples(&self) -> &'static [Example] {
-        &[Example {
+        &[example!(
             title: "Remove the datadog api key",
             source: r#"remove_secret("datadog_api_key")"#,
             result: Ok("null"),
-        }]
+        )]
     }
 
     fn compile(
@@ -54,6 +53,6 @@ impl FunctionExpression for RemoveSecretFn {
     }
 
     fn type_def(&self, _: &TypeState) -> TypeDef {
-        TypeDef::null().infallible()
+        TypeDef::null().infallible().impure()
     }
 }

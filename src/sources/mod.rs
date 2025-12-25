@@ -29,7 +29,7 @@ pub mod exec;
 pub mod file;
 #[cfg(any(
     feature = "sources-stdin",
-    all(unix, feature = "sources-file-descriptor")
+    all(unix, feature = "sources-file_descriptor")
 ))]
 pub mod file_descriptors;
 #[cfg(feature = "sources-fluent")]
@@ -58,10 +58,14 @@ pub mod kubernetes_logs;
 pub mod logstash;
 #[cfg(feature = "sources-mongodb_metrics")]
 pub mod mongodb_metrics;
+#[cfg(feature = "sources-mqtt")]
+pub mod mqtt;
 #[cfg(feature = "sources-nats")]
 pub mod nats;
 #[cfg(feature = "sources-nginx_metrics")]
 pub mod nginx_metrics;
+#[cfg(feature = "sources-okta")]
+pub mod okta;
 #[cfg(feature = "sources-opentelemetry")]
 pub mod opentelemetry;
 #[cfg(feature = "sources-postgresql_metrics")]
@@ -80,20 +84,27 @@ pub mod redis;
 pub mod socket;
 #[cfg(feature = "sources-splunk_hec")]
 pub mod splunk_hec;
+#[cfg(feature = "sources-static_metrics")]
+pub mod static_metrics;
 #[cfg(feature = "sources-statsd")]
 pub mod statsd;
 #[cfg(feature = "sources-syslog")]
 pub mod syslog;
 #[cfg(feature = "sources-vector")]
 pub mod vector;
+#[cfg(feature = "sources-websocket")]
+pub mod websocket;
 
 pub mod util;
 
 pub use vector_lib::source::Source;
 
+#[allow(dead_code)] // Easier than listing out all the features that use this
 /// Common build errors
 #[derive(Debug, Snafu)]
-enum BuildError {
+pub enum BuildError {
     #[snafu(display("URI parse error: {}", source))]
     UriParseError { source: ::http::uri::InvalidUri },
+    #[snafu(display("VRL compilation error: {}", message))]
+    VrlCompilationError { message: String },
 }

@@ -1,4 +1,4 @@
-See [DEPRECATION.md](docs/DEPRECATION.md#process) for the process for updating this file.
+See [DEPRECATION.md](/docs/DEPRECATION.md#process) for the process for updating this file.
 
 The format for each entry should be: `<version> <identifier> <description>`.
 
@@ -14,8 +14,8 @@ For example:
 
 ## To be deprecated
 
+- `v0.50.0` | `http-server-encoding` | The `encoding` field will be removed. Use `decoding` and `framing` instead.
+
 ## To be migrated
 
 ## To be removed
-
-- v0.39.0 enterprise_feature The `enterprise` feature has been deprecated and will be removed.

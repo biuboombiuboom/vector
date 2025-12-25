@@ -5,37 +5,40 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{
-    channel::mpsc::{Receiver, TryRecvError},
     StreamExt,
+    channel::mpsc::{Receiver, TryRecvError},
 };
 use http::request::Parts;
 use indoc::indoc;
 use vector_lib::{
-    config::{init_telemetry, Tags, Telemetry},
+    config::{Tags, Telemetry, init_telemetry},
     event::{BatchNotifier, BatchStatus, Event, LogEvent},
 };
 
-use crate::sinks::datadog::test_utils::{test_server, ApiStatus};
+use super::{super::DatadogApiError, config::DatadogLogsConfig, service::LogApiRetry};
 use crate::{
     common::datadog,
     config::{SinkConfig, SinkContext},
     extra_context::ExtraContext,
     http::HttpError,
     sinks::{
-        util::retries::RetryLogic,
-        util::test::{load_sink, load_sink_with_context},
+        datadog::test_utils::{ApiStatus, test_server},
+        util::{
+            retries::RetryLogic,
+            test::{load_sink, load_sink_with_context},
+        },
     },
     test_util::{
+        addr::next_addr,
         components::{
+            COMPONENT_ERROR_TAGS, DATA_VOLUME_SINK_TAGS, SINK_TAGS,
             run_and_assert_data_volume_sink_compliance, run_and_assert_sink_compliance,
-            run_and_assert_sink_error, COMPONENT_ERROR_TAGS, DATA_VOLUME_SINK_TAGS, SINK_TAGS,
+            run_and_assert_sink_error,
         },
-        next_addr, random_lines_with_stream,
+        random_lines_with_stream,
     },
     tls::TlsError,
 };
-
-use super::{super::DatadogApiError, config::DatadogLogsConfig, service::LogApiRetry};
 
 fn event_with_api_key(msg: &str, key: &str) -> Event {
     let mut e = Event::Log(LogEvent::from(msg));
@@ -84,10 +87,10 @@ async fn start_test_detail(
         "#};
     let (mut config, cx) = load_sink::<DatadogLogsConfig>(config).unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it
     // to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -240,9 +243,9 @@ async fn api_key_in_metadata_inner(api_status: ApiStatus) {
         "#})
     .unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -254,7 +257,7 @@ async fn api_key_in_metadata_inner(api_status: ApiStatus) {
 
     let api_key = "0xDECAFBAD";
     let events = events.map(|mut e| {
-        println!("EVENT: {:?}", e);
+        println!("EVENT: {e:?}");
         e.iter_logs_mut().for_each(|log| {
             log.metadata_mut().set_datadog_api_key(Arc::from(api_key));
         });
@@ -319,10 +322,10 @@ async fn multiple_api_keys_inner(api_status: ApiStatus) {
         "#})
     .unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it
     // to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -349,104 +352,33 @@ async fn multiple_api_keys_inner(api_status: ApiStatus) {
 }
 
 #[tokio::test]
-/// Assert that events are sent and the DD-EVP-ORIGIN header is set when
-/// 'enterprise' is flagged on, v2 API
+/// Assert that events are sent and the DD-EVP-ORIGIN header is not set, v2 API
 ///
-/// Vector allows for flagging a global 'enterprise' context that indicates
-/// whether we're running in Datadog enterprise mode or not. When this flag is
-/// active we should set the origin header discussed above correctly, as well as
+/// When this flag is not active we should not set the origin header discussed above, as well as
 /// still sending events through the sink.
-async fn enterprise_headers_v2() {
-    enterprise_headers_inner(ApiStatus::OKv2).await
+async fn headers_v2() {
+    headers_inner(ApiStatus::OKv2).await
 }
 
 #[tokio::test]
-/// Assert that events are sent and the DD-EVP-ORIGIN header is set when
-/// 'enterprise' is flagged on, v1 API
+/// Assert that events are sent and the DD-EVP-ORIGIN header is not set, v1 API
 ///
-/// Vector allows for flagging a global 'enterprise' context that indicates
-/// whether we're running in Datadog enterprise mode or not. When this flag is
-/// active we should set the origin header discussed above correctly, as well as
+/// When this flag is not active we should not set the origin header discussed above, as well as
 /// still sending events through the sink.
-async fn enterprise_headers_v1() {
-    enterprise_headers_inner(ApiStatus::OKv1).await
+async fn headers_v1() {
+    headers_inner(ApiStatus::OKv1).await
 }
 
-async fn enterprise_headers_inner(api_status: ApiStatus) {
-    let (mut config, mut cx) = load_sink::<DatadogLogsConfig>(indoc! {r#"
-            default_api_key = "atoken"
-            compression = "none"
-        "#})
-    .unwrap();
-    cx.app_name = "Vector Enterprise".to_string();
-    cx.app_name_slug = "vector-enterprise".to_string();
-
-    let addr = next_addr();
-    // Swap out the endpoint so we can force send it to our local server
-    let endpoint = format!("http://{}", addr);
-    config.local_dd_common.endpoint = Some(endpoint.clone());
-
-    let (sink, _) = config.build(cx).await.unwrap();
-
-    let (rx, _trigger, server) = test_server(addr, api_status);
-    tokio::spawn(server);
-
-    let (_expected_messages, events) = random_lines_with_stream(100, 10, None);
-
-    let api_key = "0xDECAFBAD";
-    let events = events.map(|mut e| {
-        println!("EVENT: {:?}", e);
-        e.iter_logs_mut().for_each(|log| {
-            log.metadata_mut().set_datadog_api_key(Arc::from(api_key));
-        });
-        e
-    });
-
-    sink.run(events).await.unwrap();
-    let output: (Parts, Bytes) = rx.take(1).collect::<Vec<_>>().await.pop().unwrap();
-    let parts = output.0;
-
-    assert_eq!(
-        parts.headers.get("DD-EVP-ORIGIN").unwrap(),
-        "vector-enterprise"
-    );
-    assert!(parts.headers.get("DD-EVP-ORIGIN-VERSION").is_some());
-}
-
-#[tokio::test]
-/// Assert that events are sent and the DD-EVP-ORIGIN header is not set when
-/// 'enterprise' is flagged off, v2 API
-///
-/// Vector allows for flagging a global 'enterprise' context that indicates
-/// whether we're running in Datadog enterprise mode or not. When this flag is
-/// not active we should not set the origin header discussed above, as well as
-/// still sending events through the sink.
-async fn no_enterprise_headers_v2() {
-    no_enterprise_headers_inner(ApiStatus::OKv2).await
-}
-
-#[tokio::test]
-/// Assert that events are sent and the DD-EVP-ORIGIN header is not set when
-/// 'enterprise' is flagged off, v1 API
-///
-/// Vector allows for flagging a global 'enterprise' context that indicates
-/// whether we're running in Datadog enterprise mode or not. When this flag is
-/// not active we should not set the origin header discussed above, as well as
-/// still sending events through the sink.
-async fn no_enterprise_headers_v1() {
-    no_enterprise_headers_inner(ApiStatus::OKv1).await
-}
-
-async fn no_enterprise_headers_inner(api_status: ApiStatus) {
+async fn headers_inner(api_status: ApiStatus) {
     let (mut config, cx) = load_sink::<DatadogLogsConfig>(indoc! {r#"
             default_api_key = "atoken"
             compression = "none"
         "#})
     .unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -458,7 +390,7 @@ async fn no_enterprise_headers_inner(api_status: ApiStatus) {
 
     let api_key = "0xDECAFBAD";
     let events = events.map(|mut e| {
-        println!("EVENT: {:?}", e);
+        println!("EVENT: {e:?}");
         e.iter_logs_mut().for_each(|log| {
             log.metadata_mut().set_datadog_api_key(Arc::from(api_key));
         });
@@ -515,8 +447,8 @@ async fn does_not_send_too_big_payloads() {
         "#})
     .unwrap();
 
-    let addr = next_addr();
-    let endpoint = format!("http://{}", addr);
+    let (_guard, addr) = next_addr();
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -549,7 +481,7 @@ async fn does_not_send_too_big_payloads() {
 
     assert!(!sizes.is_empty());
     for size in sizes {
-        assert!(size < 5_000_000, "{} not less than max", size);
+        assert!(size < 5_000_000, "{size} not less than max");
     }
 }
 
@@ -567,10 +499,10 @@ async fn global_options() {
     };
     let (mut config, cx) = load_sink_with_context::<DatadogLogsConfig>(config, cx).unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it
     // to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -591,9 +523,10 @@ async fn global_options() {
         .collect::<Vec<_>>()
         .await;
 
-    assert!(keys
-        .iter()
-        .all(|value| value.to_str().unwrap() == "global-key"));
+    assert!(
+        keys.iter()
+            .all(|value| value.to_str().unwrap() == "global-key")
+    );
 }
 
 #[tokio::test]
@@ -613,10 +546,10 @@ async fn override_global_options() {
     };
     let (mut config, cx) = load_sink_with_context::<DatadogLogsConfig>(config, cx).unwrap();
 
-    let addr = next_addr();
+    let (_guard, addr) = next_addr();
     // Swap out the endpoint so we can force send it
     // to our local server
-    let endpoint = format!("http://{}", addr);
+    let endpoint = format!("http://{addr}");
     config.local_dd_common.endpoint = Some(endpoint.clone());
 
     let (sink, _) = config.build(cx).await.unwrap();
@@ -637,7 +570,8 @@ async fn override_global_options() {
         .collect::<Vec<_>>()
         .await;
 
-    assert!(keys
-        .iter()
-        .all(|value| value.to_str().unwrap() == "local-key"));
+    assert!(
+        keys.iter()
+            .all(|value| value.to_str().unwrap() == "local-key")
+    );
 }

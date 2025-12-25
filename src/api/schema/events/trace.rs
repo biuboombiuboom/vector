@@ -1,9 +1,8 @@
 use async_graphql::Object;
-use vector_lib::encode_logfmt;
+use vector_lib::{encode_logfmt, event, tap::topology::TapOutput};
 use vrl::event_path;
 
 use super::EventEncodingType;
-use crate::{event, topology::TapOutput};
 
 #[derive(Debug, Clone)]
 pub struct Trace {

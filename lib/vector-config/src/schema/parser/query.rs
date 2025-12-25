@@ -117,29 +117,25 @@ impl<'a> SchemaQueryBuilder<'a> {
                             let attr_matched = match self_attribute {
                                 CustomAttribute::Flag(key) => schema_attributes
                                     .get(key)
-                                    .map_or(false, |value| matches!(value, Value::Bool(true))),
+                                    .is_some_and(|value| matches!(value, Value::Bool(true))),
                                 CustomAttribute::KeyValue {
                                     key,
                                     value: attr_value,
                                 } => {
-                                    schema_attributes
-                                        .get(key)
-                                        .map_or(false, |value| match value {
-                                            // Check string values directly.
-                                            Value::String(schema_attr_value) => {
-                                                schema_attr_value == attr_value
-                                            }
-                                            // For arrays, try and convert each item to a string, and
-                                            // for the values that are strings, see if they match.
-                                            Value::Array(schema_attr_values) => {
-                                                schema_attr_values.iter().any(|value| {
-                                                    value
-                                                        .as_str()
-                                                        .map_or(false, |s| s == attr_value)
-                                                })
-                                            }
-                                            _ => false,
-                                        })
+                                    schema_attributes.get(key).is_some_and(|value| match value {
+                                        // Check string values directly.
+                                        Value::String(schema_attr_value) => {
+                                            schema_attr_value == attr_value
+                                        }
+                                        // For arrays, try and convert each item to a string, and
+                                        // for the values that are strings, see if they match.
+                                        Value::Array(schema_attr_values) => {
+                                            schema_attr_values.iter().any(|value| {
+                                                value.as_str().is_some_and(|s| s == attr_value)
+                                            })
+                                        }
+                                        _ => false,
+                                    })
                                 }
                             };
 
@@ -228,7 +224,7 @@ pub enum SchemaType<'a> {
 }
 
 pub trait QueryableSchema {
-    fn schema_type(&self) -> SchemaType;
+    fn schema_type(&self) -> SchemaType<'_>;
     fn description(&self) -> Option<&str>;
     fn title(&self) -> Option<&str>;
     fn get_attributes(&self, key: &str) -> Option<OneOrMany<CustomAttribute>>;
@@ -236,11 +232,11 @@ pub trait QueryableSchema {
     fn has_flag_attribute(&self, key: &str) -> Result<bool, QueryError>;
 }
 
-impl<'a, T> QueryableSchema for &'a T
+impl<T> QueryableSchema for &T
 where
     T: QueryableSchema,
 {
-    fn schema_type(&self) -> SchemaType {
+    fn schema_type(&self) -> SchemaType<'_> {
         (*self).schema_type()
     }
 
@@ -265,8 +261,8 @@ where
     }
 }
 
-impl<'a> QueryableSchema for &'a SchemaObject {
-    fn schema_type(&self) -> SchemaType {
+impl QueryableSchema for &SchemaObject {
+    fn schema_type(&self) -> SchemaType<'_> {
         // TODO: Technically speaking, it is allowed to use the "X of" schema types in conjunction
         // with other schema types i.e. `allOf` in conjunction with specifying a `type`.
         //
@@ -286,7 +282,9 @@ impl<'a> QueryableSchema for &'a SchemaObject {
             } else if let Some(any_of) = subschemas.any_of.as_ref() {
                 return SchemaType::AnyOf(any_of.iter().map(schema_to_simple_schema).collect());
             } else {
-                panic!("Encountered schema with subschema validation that wasn't one of the supported types: allOf, oneOf, anyOf.");
+                panic!(
+                    "Encountered schema with subschema validation that wasn't one of the supported types: allOf, oneOf, anyOf."
+                );
             }
         }
 
@@ -387,8 +385,8 @@ impl<'a> From<&'a SchemaObject> for SimpleSchema<'a> {
     }
 }
 
-impl<'a> QueryableSchema for SimpleSchema<'a> {
-    fn schema_type(&self) -> SchemaType {
+impl QueryableSchema for SimpleSchema<'_> {
+    fn schema_type(&self) -> SchemaType<'_> {
         self.schema.schema_type()
     }
 

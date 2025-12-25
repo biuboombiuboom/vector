@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 
 use metrics::counter;
+use vector_lib::NamedInternalEvent;
 use vector_lib::internal_event::InternalEvent;
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct ApiStarted {
     pub addr: SocketAddr,
     pub playground: bool,
@@ -21,6 +22,6 @@ impl InternalEvent for ApiStarted {
             graphql = %if self.graphql { graphql } else { "off" }
 
         );
-        counter!("api_started_total", 1);
+        counter!("api_started_total").increment(1);
     }
 }

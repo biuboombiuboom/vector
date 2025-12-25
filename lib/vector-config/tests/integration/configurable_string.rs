@@ -1,7 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use indexmap::IndexMap;
-use vector_config::{configurable_component, schema::generate_root_schema, ConfigurableString};
+use vector_config::{ConfigurableString, configurable_component, schema::generate_root_schema};
 
 /// A type that pretends to be `ConfigurableString` but has a non-string-like schema.
 #[configurable_component]
@@ -10,9 +13,10 @@ pub struct FakeString(u64);
 
 impl ConfigurableString for FakeString {}
 
-impl ToString for FakeString {
-    fn to_string(&self) -> String {
-        self.0.to_string()
+impl fmt::Display for FakeString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Implement the fmt method to define the display format
+        write!(f, "{}", self.0)
     }
 }
 

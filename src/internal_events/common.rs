@@ -1,11 +1,13 @@
 use std::time::Instant;
 
 use metrics::{counter, histogram};
+use vector_lib::NamedInternalEvent;
 pub use vector_lib::internal_event::EventsReceived;
-use vector_lib::internal_event::InternalEvent;
-use vector_lib::internal_event::{error_stage, error_type, ComponentEventsDropped, UNINTENTIONAL};
+use vector_lib::internal_event::{
+    ComponentEventsDropped, InternalEvent, UNINTENTIONAL, error_stage, error_type,
+};
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct EndpointBytesReceived<'a> {
     pub byte_size: usize,
     pub protocol: &'a str,
@@ -21,21 +23,22 @@ impl InternalEvent for EndpointBytesReceived<'_> {
             endpoint = %self.endpoint,
         );
         counter!(
-            "component_received_bytes_total", self.byte_size as u64,
+            "component_received_bytes_total",
             "protocol" => self.protocol.to_owned(),
             "endpoint" => self.endpoint.to_owned(),
-        );
+        )
+        .increment(self.byte_size as u64);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct EndpointBytesSent<'a> {
     pub byte_size: usize,
     pub protocol: &'a str,
     pub endpoint: &'a str,
 }
 
-impl<'a> InternalEvent for EndpointBytesSent<'a> {
+impl InternalEvent for EndpointBytesSent<'_> {
     fn emit(self) {
         trace!(
             message = "Bytes sent.",
@@ -44,14 +47,15 @@ impl<'a> InternalEvent for EndpointBytesSent<'a> {
             endpoint = %self.endpoint
         );
         counter!(
-            "component_sent_bytes_total", self.byte_size as u64,
+            "component_sent_bytes_total",
             "protocol" => self.protocol.to_string(),
             "endpoint" => self.endpoint.to_string()
-        );
+        )
+        .increment(self.byte_size as u64);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SocketOutgoingConnectionError<E> {
     pub error: E,
 }
@@ -64,20 +68,20 @@ impl<E: std::error::Error> InternalEvent for SocketOutgoingConnectionError<E> {
             error_code = "failed_connecting",
             error_type = error_type::CONNECTION_FAILED,
             stage = error_stage::SENDING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_code" => "failed_connecting",
             "error_type" => error_type::CONNECTION_FAILED,
             "stage" => error_stage::SENDING,
-        );
+        )
+        .increment(1);
     }
 }
 
 const STREAM_CLOSED: &str = "stream_closed";
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct StreamClosedError {
     pub count: usize,
 }
@@ -89,14 +93,14 @@ impl InternalEvent for StreamClosedError {
             error_code = STREAM_CLOSED,
             error_type = error_type::WRITER_FAILED,
             stage = error_stage::SENDING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_code" => STREAM_CLOSED,
             "error_type" => error_type::WRITER_FAILED,
             "stage" => error_stage::SENDING,
-        );
+        )
+        .increment(1);
         emit!(ComponentEventsDropped::<UNINTENTIONAL> {
             count: self.count,
             reason: "Downstream is closed.",
@@ -104,7 +108,7 @@ impl InternalEvent for StreamClosedError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct CollectionCompleted {
     pub start: Instant,
     pub end: Instant,
@@ -113,12 +117,12 @@ pub struct CollectionCompleted {
 impl InternalEvent for CollectionCompleted {
     fn emit(self) {
         debug!(message = "Collection completed.");
-        counter!("collect_completed_total", 1);
-        histogram!("collect_duration_seconds", self.end - self.start);
+        counter!("collect_completed_total").increment(1);
+        histogram!("collect_duration_seconds").record(self.end - self.start);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, NamedInternalEvent)]
 pub struct SinkRequestBuildError<E> {
     pub error: E,
 }
@@ -133,12 +137,12 @@ impl<E: std::fmt::Display> InternalEvent for SinkRequestBuildError<E> {
             error = %self.error,
             error_type = error_type::ENCODER_FAILED,
             stage = error_stage::PROCESSING,
-            internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_type" => error_type::ENCODER_FAILED,
             "stage" => error_stage::PROCESSING,
-        );
+        )
+        .increment(1);
     }
 }

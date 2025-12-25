@@ -1,15 +1,13 @@
-use aws_sdk_elasticsearch::{types::DomainEndpointOptions, Client as EsClient};
+use aws_sdk_elasticsearch::{Client as EsClient, types::DomainEndpointOptions};
 use aws_sdk_firehose::types::ElasticsearchDestinationConfiguration;
-use futures::StreamExt;
-use futures::TryFutureExt;
-use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
-use vector_lib::codecs::JsonSerializerConfig;
-use vector_lib::lookup::lookup_v2::ConfigValuePath;
+use futures::{StreamExt, TryFutureExt};
+use serde_json::{Value, json};
+use tokio::time::{Duration, sleep};
+use vector_lib::{codecs::JsonSerializerConfig, lookup::lookup_v2::ConfigValuePath};
 
 use super::{config::KinesisFirehoseClientBuilder, *};
 use crate::{
-    aws::{create_client, AwsAuthentication, ImdsAuthentication, RegionOrEndpoint},
+    aws::{AwsAuthentication, ImdsAuthentication, RegionOrEndpoint, create_client},
     config::{ProxyConfig, SinkConfig, SinkContext},
     sinks::{
         elasticsearch::{
@@ -19,7 +17,7 @@ use crate::{
     },
     template::Template,
     test_util::{
-        components::{run_and_assert_sink_compliance, AWS_SINK_TAGS},
+        components::{AWS_SINK_TAGS, run_and_assert_sink_compliance},
         random_events_with_stream, random_string, wait_for_duration,
     },
 };
@@ -101,7 +99,7 @@ async fn firehose_put_records_without_partition_key() {
         .expect("Could not build HTTP client");
 
     let response = client
-        .get(&format!("{}/{}/_search", common.base_url, stream))
+        .get(format!("{}/{}/_search", common.base_url, stream))
         .json(&json!({
             "query": { "query_string": { "query": "*" } }
         }))
@@ -123,7 +121,7 @@ async fn firehose_put_records_without_partition_key() {
     #[allow(clippy::needless_collect)] // https://github.com/rust-lang/rust-clippy/issues/6909
     let input = input
         .into_iter()
-        .map(|rec| serde_json::to_value(&rec.into_log()).unwrap())
+        .map(|rec| serde_json::to_value(rec.into_log()).unwrap())
         .collect::<Vec<_>>();
     for hit in hits {
         let hit = hit
@@ -213,7 +211,7 @@ async fn firehose_put_records_with_partition_key() {
         .expect("Could not build HTTP client");
 
     let response = client
-        .get(&format!("{}/{}/_search", common.base_url, stream))
+        .get(format!("{}/{}/_search", common.base_url, stream))
         .json(&json!({
             "query": { "query_string": { "query": "*" } }
         }))
@@ -235,7 +233,7 @@ async fn firehose_put_records_with_partition_key() {
     #[allow(clippy::needless_collect)] // https://github.com/rust-lang/rust-clippy/issues/6909
     let input = input
         .into_iter()
-        .map(|rec| serde_json::to_value(&rec.into_log()).unwrap())
+        .map(|rec| serde_json::to_value(rec.into_log()).unwrap())
         .collect::<Vec<_>>();
     for hit in hits {
         let hit = hit
@@ -255,11 +253,13 @@ async fn firehose_client() -> aws_sdk_firehose::Client {
     let proxy = ProxyConfig::default();
 
     create_client::<KinesisFirehoseClientBuilder>(
+        &KinesisFirehoseClientBuilder {},
         &auth,
         region_endpoint.region(),
         region_endpoint.endpoint(),
         &proxy,
-        &None,
+        None,
+        None,
     )
     .await
     .unwrap()
@@ -274,7 +274,7 @@ async fn ensure_elasticsearch_domain(domain_name: String) -> String {
                     .credentials_provider(
                         test_region_endpoint().region().unwrap(),
                         &Default::default(),
-                        &None,
+                        None,
                     )
                     .await
                     .unwrap(),
@@ -297,7 +297,7 @@ async fn ensure_elasticsearch_domain(domain_name: String) -> String {
         .await
     {
         Ok(res) => res.domain_status.expect("no domain status").arn,
-        Err(error) => panic!("Unable to create the Elasticsearch domain {:?}", error),
+        Err(error) => panic!("Unable to create the Elasticsearch domain {error:?}"),
     };
 
     // wait for ES to be available; it starts up when the ES domain is created
@@ -345,7 +345,7 @@ async fn ensure_elasticsearch_delivery_stream(
         .await
     {
         Ok(_) => (),
-        Err(error) => panic!("Unable to create the delivery stream {:?}", error),
+        Err(error) => panic!("Unable to create the delivery stream {error:?}"),
     };
 }
 

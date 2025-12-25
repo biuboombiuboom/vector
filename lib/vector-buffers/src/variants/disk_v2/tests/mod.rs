@@ -10,14 +10,14 @@ use tokio::{
 };
 
 use super::{
+    Buffer, BufferReader, BufferWriter, DiskBufferConfigBuilder, Filesystem, Ledger,
     io::{AsyncFile, Metadata, ProductionFilesystem, ReadableMemoryMap, WritableMemoryMap},
     ledger::LEDGER_LEN,
     record::RECORD_HEADER_LEN,
-    Buffer, BufferReader, BufferWriter, DiskBufferConfigBuilder, Filesystem, Ledger,
 };
 use crate::{
-    buffer_usage_data::BufferUsageHandle, encoding::FixedEncodable,
-    variants::disk_v2::common::align16, Bufferable,
+    Bufferable, buffer_usage_data::BufferUsageHandle, encoding::FixedEncodable,
+    variants::disk_v2::common::align16,
 };
 
 type FilesystemUnderTest = ProductionFilesystem;
@@ -82,7 +82,7 @@ macro_rules! assert_buffer_records {
     ($ledger:expr, $record_count:expr) => {
         assert_eq!(
             $ledger.get_total_records(),
-            $record_count as u64,
+            u64::try_from($record_count).expect("Record count is out of range"),
             "ledger should have {} records, but had {}",
             $record_count,
             $ledger.get_total_records()
@@ -95,14 +95,14 @@ macro_rules! assert_buffer_size {
     ($ledger:expr, $record_count:expr, $buffer_size:expr) => {
         assert_eq!(
             $ledger.get_total_records(),
-            $record_count as u64,
+            u64::try_from($record_count).expect("Record count is out of range"),
             "ledger should have {} records, but had {}",
             $record_count,
             $ledger.get_total_records()
         );
         assert_eq!(
             $ledger.get_total_buffer_size(),
-            $buffer_size as u64,
+            u64::try_from($buffer_size).expect("Buffer size is out of range"),
             "ledger should have {} bytes, but had {} bytes",
             $buffer_size,
             $ledger.get_total_buffer_size()
@@ -115,14 +115,14 @@ macro_rules! assert_reader_writer_v2_file_positions {
     ($ledger:expr, $reader:expr, $writer:expr) => {{
         let (reader, writer) = $ledger.get_current_reader_writer_file_id();
         assert_eq!(
-            ($reader) as u16,
+            u16::try_from($reader).expect("Reader value is out of range"),
             reader,
             "expected reader file ID of {}, got {} instead",
             ($reader),
             reader
         );
         assert_eq!(
-            ($writer) as u16,
+            u16::try_from($writer).expect("Writer value is out of range"),
             writer,
             "expected writer file ID of {}, got {} instead",
             ($writer),

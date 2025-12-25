@@ -1,7 +1,6 @@
 use std::convert::TryFrom;
 
 use snafu::{ResultExt, Snafu};
-
 use vector_lib::configurable::configurable_component;
 
 use crate::{
@@ -21,8 +20,6 @@ pub(super) enum BuildError {
     MessageGroupIdNotAllowed,
     #[snafu(display("invalid topic template: {}", source))]
     TopicTemplate { source: TemplateParseError },
-    #[snafu(display("invalid message_deduplication_id template: {}", source))]
-    MessageDeduplicationIdTemplate { source: TemplateParseError },
 }
 
 /// Base Configuration `aws_s_s` for sns and sqs sink.

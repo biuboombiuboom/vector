@@ -5,21 +5,23 @@ use futures_util::future::BoxFuture;
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
 use snafu::{ResultExt, Snafu};
-use vector_lib::lookup::lookup_v2::{OptionalTargetPath, OptionalValuePath};
-use vector_lib::{config::proxy::ProxyConfig, event::EventRef};
+use vector_lib::{
+    config::proxy::ProxyConfig,
+    event::EventRef,
+    lookup::lookup_v2::{OptionalTargetPath, OptionalValuePath},
+};
 
 use super::{
+    EndpointTarget,
     request::HecRequest,
     service::{HttpRequestBuilder, MetadataFields},
-    EndpointTarget,
 };
 use crate::{
     http::HttpClient,
     internal_events::TemplateRenderingError,
     sinks::{
-        self,
-        util::{http::HttpBatchService, SinkBatchSettings},
-        UriParseSnafu,
+        self, UriParseSnafu,
+        util::{SinkBatchSettings, http::HttpBatchService},
     },
     template::Template,
     tls::{TlsConfig, TlsSettings},
@@ -43,7 +45,7 @@ pub enum HealthcheckError {
 }
 
 pub fn create_client(
-    tls: &Option<TlsConfig>,
+    tls: Option<&TlsConfig>,
     proxy_config: &ProxyConfig,
 ) -> crate::Result<HttpClient> {
     let tls_settings = TlsSettings::from_options(tls)?;
@@ -92,7 +94,7 @@ pub async fn build_healthcheck(
         .context(UriParseSnafu)?;
 
     let request = Request::get(uri)
-        .header("Authorization", format!("Splunk {}", token))
+        .header("Authorization", format!("Splunk {token}"))
         .body(Body::empty())
         .unwrap();
 
@@ -172,15 +174,14 @@ mod tests {
     use http::{HeaderValue, Uri};
     use vector_lib::config::proxy::ProxyConfig;
     use wiremock::{
-        matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
     };
 
     use crate::sinks::{
         splunk_hec::common::{
-            build_healthcheck, build_uri, create_client,
+            EndpointTarget, HOST_FIELD, SOURCE_FIELD, build_healthcheck, build_uri, create_client,
             service::{HttpRequestBuilder, MetadataFields},
-            EndpointTarget, HOST_FIELD, SOURCE_FIELD,
         },
         util::Compression,
     };
@@ -196,7 +197,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let healthcheck = build_healthcheck(mock_server.uri(), "token".to_string(), client);
 
         assert!(healthcheck.await.is_ok())
@@ -213,7 +214,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let healthcheck = build_healthcheck(mock_server.uri(), "token".to_string(), client);
 
         assert_eq!(
@@ -233,7 +234,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let healthcheck = build_healthcheck(mock_server.uri(), "token".to_string(), client);
 
         assert_eq!(
@@ -253,7 +254,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let healthcheck = build_healthcheck(mock_server.uri(), "token".to_string(), client);
 
         assert_eq!(
@@ -413,7 +414,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn splunk_healthcheck_ok() {
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let address = splunk_hec_address();
         let token = get_token().await;
 
@@ -427,7 +428,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn splunk_healthcheck_server_not_listening() {
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let healthcheck = build_healthcheck(
             "http://localhost:1111/".to_string(),
             get_token().await,
@@ -439,7 +440,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn splunk_healthcheck_server_unavailable() {
-        let client = create_client(&None, &ProxyConfig::default()).unwrap();
+        let client = create_client(None, &ProxyConfig::default()).unwrap();
         let healthcheck = build_healthcheck(
             "http://localhost:5503/".to_string(),
             get_token().await,

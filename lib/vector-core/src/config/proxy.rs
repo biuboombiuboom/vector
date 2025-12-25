@@ -25,9 +25,9 @@ impl NoProxyInterceptor {
                 if scheme.is_some() && scheme != Some(expected_scheme) {
                     return false;
                 }
-                let matches = host.map_or(false, |host| {
+                let matches = host.is_some_and(|host| {
                     self.0.matches(host)
-                        || port.map_or(false, |port| {
+                        || port.is_some_and(|port| {
                             let url = format!("{host}:{port}");
                             self.0.matches(&url)
                         })
@@ -44,7 +44,7 @@ impl NoProxyInterceptor {
 /// Configure to proxy traffic through an HTTP(S) proxy when making external requests.
 ///
 /// Similar to common proxy configuration convention, you can set different proxies
-/// to use based on the type of traffic being proxied, as well as set specific hosts that
+/// to use based on the type of traffic being proxied. You can also set specific hosts that
 /// should not be proxied.
 #[configurable_component]
 #[configurable(metadata(docs::advanced))]
@@ -154,20 +154,21 @@ impl ProxyConfig {
     fn build_proxy(
         &self,
         proxy_scheme: &'static str,
-        proxy_url: &Option<String>,
+        proxy_url: Option<&String>,
     ) -> Result<Option<Proxy>, InvalidUri> {
         proxy_url
             .as_ref()
             .map(|url| {
                 url.parse().map(|parsed| {
                     let mut proxy = Proxy::new(self.interceptor().intercept(proxy_scheme), parsed);
-                    if let Ok(authority) = Url::parse(url) {
-                        if let Some(password) = authority.password() {
-                            proxy.set_authorization(Authorization::basic(
-                                authority.username(),
-                                password,
-                            ));
-                        }
+                    if let Ok(authority) = Url::parse(url)
+                        && let Some(password) = authority.password()
+                    {
+                        let decoded_user = urlencoding::decode(authority.username())
+                            .expect("username must be valid UTF-8.");
+                        let decoded_pw =
+                            urlencoding::decode(password).expect("Password must be valid UTF-8.");
+                        proxy.set_authorization(Authorization::basic(&decoded_user, &decoded_pw));
                     }
                     proxy
                 })
@@ -176,11 +177,11 @@ impl ProxyConfig {
     }
 
     fn http_proxy(&self) -> Result<Option<Proxy>, InvalidUri> {
-        self.build_proxy("http", &self.http)
+        self.build_proxy("http", self.http.as_ref())
     }
 
     fn https_proxy(&self) -> Result<Option<Proxy>, InvalidUri> {
-        self.build_proxy("https", &self.https)
+        self.build_proxy("https", self.https.as_ref())
     }
 
     /// Install the [`ProxyConnector<C>`] for this `ProxyConfig`
@@ -203,11 +204,11 @@ impl ProxyConfig {
 
 #[cfg(test)]
 mod tests {
-    use base64::prelude::{Engine as _, BASE64_STANDARD};
+    use base64::prelude::{BASE64_STANDARD, Engine as _};
     use env_test_util::TempEnvVar;
     use http::{
-        header::{AUTHORIZATION, PROXY_AUTHORIZATION},
         HeaderName, HeaderValue, Uri,
+        header::{AUTHORIZATION, PROXY_AUTHORIZATION},
     };
     use proptest::prelude::*;
 
@@ -397,7 +398,6 @@ mod tests {
         }
     }
 
-    #[ignore]
     #[test]
     fn build_proxy_with_special_chars_url_encoded() {
         let config = ProxyConfig {

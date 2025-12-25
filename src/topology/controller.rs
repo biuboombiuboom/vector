@@ -1,21 +1,17 @@
 use std::sync::Arc;
 
-#[cfg(feature = "enterprise")]
-use futures_util::future::BoxFuture;
 use futures_util::FutureExt as _;
-
 use tokio::sync::{Mutex, MutexGuard};
 
 #[cfg(feature = "api")]
 use crate::api;
-#[cfg(feature = "enterprise")]
-use crate::config::enterprise::{
-    report_on_reload, EnterpriseError, EnterpriseMetadata, EnterpriseReporter,
+use crate::{
+    config,
+    extra_context::ExtraContext,
+    internal_events::{VectorRecoveryError, VectorReloadError, VectorReloaded},
+    signal::ShutdownError,
+    topology::{ReloadError, RunningTopology},
 };
-use crate::extra_context::ExtraContext;
-use crate::internal_events::{VectorRecoveryError, VectorReloadError, VectorReloaded};
-
-use crate::{config, signal::ShutdownError, topology::RunningTopology};
 
 #[derive(Clone, Debug)]
 pub struct SharedTopologyController(Arc<Mutex<TopologyController>>);
@@ -25,7 +21,11 @@ impl SharedTopologyController {
         Self(Arc::new(Mutex::new(inner)))
     }
 
-    pub async fn lock(&self) -> MutexGuard<TopologyController> {
+    pub fn blocking_lock(&self) -> MutexGuard<'_, TopologyController> {
+        self.0.blocking_lock()
+    }
+
+    pub async fn lock(&self) -> MutexGuard<'_, TopologyController> {
         self.0.lock().await
     }
 
@@ -38,8 +38,6 @@ pub struct TopologyController {
     pub topology: RunningTopology,
     pub config_paths: Vec<config::ConfigPath>,
     pub require_healthy: Option<bool>,
-    #[cfg(feature = "enterprise")]
-    pub enterprise_reporter: Option<EnterpriseReporter<BoxFuture<'static, ()>>>,
     #[cfg(feature = "api")]
     pub api_server: Option<api::Server>,
     pub extra_context: ExtraContext,
@@ -68,27 +66,6 @@ impl TopologyController {
             .healthchecks
             .set_require_healthy(self.require_healthy);
 
-        #[cfg(feature = "enterprise")]
-        // Augment config to enable observability within Datadog, if applicable.
-        match EnterpriseMetadata::try_from(&new_config) {
-            Ok(metadata) => {
-                if let Some(e) = report_on_reload(
-                    &mut new_config,
-                    metadata,
-                    self.config_paths.clone(),
-                    self.enterprise_reporter.as_ref(),
-                ) {
-                    self.enterprise_reporter = Some(e);
-                }
-            }
-            Err(err) => {
-                if let EnterpriseError::MissingApiKey = err {
-                    emit!(VectorReloadError);
-                    return ReloadOutcome::MissingApiKey;
-                }
-            }
-        }
-
         // Start the api server or disable it, if necessary
         #[cfg(feature = "api")]
         if !new_config.api.enabled {
@@ -97,9 +74,11 @@ impl TopologyController {
                 drop(server)
             }
         } else if self.api_server.is_none() {
-            use crate::internal_events::ApiStarted;
             use std::sync::atomic::AtomicBool;
+
             use tokio::runtime::Handle;
+
+            use crate::internal_events::ApiStarted;
 
             debug!("Starting api server.");
 
@@ -131,7 +110,7 @@ impl TopologyController {
             .reload_config_and_respawn(new_config, self.extra_context.clone())
             .await
         {
-            Ok(true) => {
+            Ok(()) => {
                 #[cfg(feature = "api")]
                 // Pass the new config to the API server.
                 if let Some(ref api_server) = self.api_server {
@@ -143,13 +122,38 @@ impl TopologyController {
                 });
                 ReloadOutcome::Success
             }
-            Ok(false) => {
-                emit!(VectorReloadError);
+            Err(ReloadError::GlobalOptionsChanged { changed_fields }) => {
+                error!(
+                    message = "Config reload rejected due to non-reloadable global options.",
+                    changed_fields = %changed_fields.join(", "),
+                    internal_log_rate_limit = false,
+                );
+                emit!(VectorReloadError {
+                    reason: "global_options_changed",
+                });
                 ReloadOutcome::RolledBack
             }
-            // Trigger graceful shutdown for what remains of the topology
-            Err(()) => {
-                emit!(VectorReloadError);
+            Err(ReloadError::GlobalDiffFailed { source }) => {
+                error!(
+                    message = "Config reload rejected because computing global diff failed.",
+                    error = %source,
+                    internal_log_rate_limit = false,
+                );
+                emit!(VectorReloadError {
+                    reason: "global_diff_failed",
+                });
+                ReloadOutcome::RolledBack
+            }
+            Err(ReloadError::TopologyBuildFailed) => {
+                emit!(VectorReloadError {
+                    reason: "topology_build_failed",
+                });
+                ReloadOutcome::RolledBack
+            }
+            Err(ReloadError::FailedToRestore) => {
+                emit!(VectorReloadError {
+                    reason: "restore_failed",
+                });
                 emit!(VectorRecoveryError);
                 ReloadOutcome::FatalError(ShutdownError::ReloadFailedToRestore)
             }

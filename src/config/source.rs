@@ -1,13 +1,13 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
-use vector_lib::configurable::attributes::CustomAttribute;
-use vector_lib::configurable::schema::{SchemaGenerator, SchemaObject};
-use vector_lib::configurable::{
-    configurable_component, Configurable, GenerateError, Metadata, NamedComponent,
+use vector_config::{Configurable, GenerateError, Metadata, NamedComponent};
+use vector_config_common::{
+    attributes::CustomAttribute,
+    schema::{SchemaGenerator, SchemaObject},
 };
+use vector_config_macros::configurable_component;
 use vector_lib::{
     config::{
         AcknowledgementsConfig, GlobalOptions, LogNamespace, SourceAcknowledgementsConfig,
@@ -16,8 +16,8 @@ use vector_lib::{
     source::Source,
 };
 
-use super::{schema, ComponentKey, ProxyConfig, Resource};
-use crate::{extra_context::ExtraContext, shutdown::ShutdownSignal, SourceSender};
+use super::{ComponentKey, ProxyConfig, Resource, dot_graph::GraphConfig, schema};
+use crate::{SourceSender, extra_context::ExtraContext, shutdown::ShutdownSignal};
 
 pub type BoxedSource = Box<dyn SourceConfig>;
 
@@ -34,8 +34,10 @@ impl Configurable for BoxedSource {
         metadata
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
-        vector_lib::configurable::component::SourceDescription::generate_schemas(gen)
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
+        vector_lib::configurable::component::SourceDescription::generate_schemas(generator)
     }
 }
 
@@ -54,6 +56,10 @@ pub struct SourceOuter {
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub proxy: ProxyConfig,
 
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub graph: GraphConfig,
+
     #[serde(default, skip)]
     pub sink_acknowledgements: bool,
 
@@ -66,6 +72,7 @@ impl SourceOuter {
     pub(crate) fn new<I: Into<BoxedSource>>(inner: I) -> Self {
         Self {
             proxy: Default::default(),
+            graph: Default::default(),
             sink_acknowledgements: false,
             inner: inner.into(),
         }
@@ -113,6 +120,12 @@ pub trait SourceConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sy
     /// well as emit contextual warnings when end-to-end acknowledgements are enabled, but the
     /// topology as configured does not actually support the use of end-to-end acknowledgements.
     fn can_acknowledge(&self) -> bool;
+
+    /// If this source supports timeout returns from the `SourceSender` and the configuration
+    /// provides a timeout value, return it here and the `out` channel will be configured with it.
+    fn send_timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 dyn_clone::clone_trait_object!(SourceConfig);
@@ -120,6 +133,7 @@ dyn_clone::clone_trait_object!(SourceConfig);
 pub struct SourceContext {
     pub key: ComponentKey,
     pub globals: GlobalOptions,
+    pub enrichment_tables: vector_lib::enrichment::TableRegistry,
     pub shutdown: ShutdownSignal,
     pub out: SourceSender,
     pub proxy: ProxyConfig,
@@ -149,6 +163,7 @@ impl SourceContext {
             Self {
                 key: key.clone(),
                 globals: GlobalOptions::default(),
+                enrichment_tables: Default::default(),
                 shutdown: shutdown_signal,
                 out,
                 proxy: Default::default(),
@@ -169,6 +184,7 @@ impl SourceContext {
         Self {
             key: ComponentKey::from("default"),
             globals: GlobalOptions::default(),
+            enrichment_tables: Default::default(),
             shutdown: ShutdownSignal::noop(),
             out,
             proxy: Default::default(),

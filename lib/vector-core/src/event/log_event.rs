@@ -1,5 +1,3 @@
-use bytes::Bytes;
-use chrono::Utc;
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
@@ -7,35 +5,42 @@ use std::{
     iter::FromIterator,
     mem::size_of,
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
+use bytes::Bytes;
+use chrono::Utc;
 use crossbeam_utils::atomic::AtomicCell;
-use lookup::{lookup_v2::TargetPath, metadata_path, path, PathPrefix};
-use once_cell::sync::Lazy;
+use lookup::{PathPrefix, lookup_v2::TargetPath, metadata_path, path};
 use serde::{Deserialize, Serialize, Serializer};
 use vector_common::{
+    EventDataEq,
     byte_size_of::ByteSizeOf,
     internal_event::{OptionalTag, TaggedEventsSent},
     json_size::{JsonSize, NonZeroJsonSize},
     request_metadata::GetEventCountTags,
-    EventDataEq,
 };
-use vrl::path::{parse_target_path, OwnedTargetPath, PathParseError};
-use vrl::{event_path, owned_value_path};
+use vrl::{
+    event_path, owned_value_path,
+    path::{OwnedTargetPath, PathParseError, parse_target_path},
+};
 
 use super::{
+    EventFinalizers, Finalizable, KeyString, ObjectMap, Value,
     estimated_json_encoded_size_of::EstimatedJsonEncodedSizeOf,
     finalization::{BatchNotifier, EventFinalizer},
     metadata::EventMetadata,
-    util, EventFinalizers, Finalizable, KeyString, ObjectMap, Value,
+    util,
 };
-use crate::config::LogNamespace;
-use crate::config::{log_schema, telemetry};
-use crate::event::util::log::{all_fields, all_metadata_fields};
-use crate::event::MaybeAsLogMut;
+use crate::{
+    config::{LogNamespace, log_schema, telemetry},
+    event::{
+        MaybeAsLogMut,
+        util::log::{all_fields, all_fields_skip_array_elements, all_metadata_fields},
+    },
+};
 
-static VECTOR_SOURCE_TYPE_PATH: Lazy<Option<OwnedTargetPath>> = Lazy::new(|| {
+static VECTOR_SOURCE_TYPE_PATH: LazyLock<Option<OwnedTargetPath>> = LazyLock::new(|| {
     Some(OwnedTargetPath::metadata(owned_value_path!(
         "vector",
         "source_type"
@@ -436,6 +441,13 @@ impl LogEvent {
         self.as_map().map(all_fields)
     }
 
+    /// Similar to [`LogEvent::all_event_fields`], but doesn't traverse individual array elements.
+    pub fn all_event_fields_skip_array_elements(
+        &self,
+    ) -> Option<impl Iterator<Item = (KeyString, &Value)> + Serialize> {
+        self.as_map().map(all_fields_skip_array_elements)
+    }
+
     /// If the metadata root value is a map, build and return an iterator to metadata field and value pairs.
     /// TODO: Ideally this should return target paths to be consistent with other `LogEvent` methods.
     pub fn all_metadata_fields(
@@ -447,11 +459,24 @@ impl LogEvent {
         }
     }
 
-    /// Returns an iterator of all fields if the value is an Object. Otherwise,
-    /// a single field is returned with a "message" key
+    /// Returns an iterator of all fields if the value is an Object. Otherwise, a single field is
+    /// returned with a "message" key. Field names that are could be interpreted as alternate paths
+    /// (i.e. containing periods, square brackets, etc) are quoted.
     pub fn convert_to_fields(&self) -> impl Iterator<Item = (KeyString, &Value)> + Serialize {
         if let Some(map) = self.as_map() {
             util::log::all_fields(map)
+        } else {
+            util::log::all_fields_non_object_root(self.value())
+        }
+    }
+
+    /// Returns an iterator of all fields if the value is an Object. Otherwise, a single field is
+    /// returned with a "message" key. Field names are not quoted.
+    pub fn convert_to_fields_unquoted(
+        &self,
+    ) -> impl Iterator<Item = (KeyString, &Value)> + Serialize {
+        if let Some(map) = self.as_map() {
+            util::log::all_fields_unquoted(map)
         } else {
             util::log::all_fields_non_object_root(self.value())
         }
@@ -604,7 +629,7 @@ impl EventDataEq for LogEvent {
 
 #[cfg(any(test, feature = "test"))]
 mod test_utils {
-    use super::*;
+    use super::{Bytes, LogEvent, Utc, log_schema};
 
     // these rely on the global log schema, which is no longer supported when using the
     // "LogNamespace::Vector" namespace.
@@ -740,7 +765,7 @@ struct TracingTargetPaths {
 }
 
 /// Lazily initialized singleton.
-static TRACING_TARGET_PATHS: Lazy<TracingTargetPaths> = Lazy::new(|| TracingTargetPaths {
+static TRACING_TARGET_PATHS: LazyLock<TracingTargetPaths> = LazyLock::new(|| TracingTargetPaths {
     timestamp: OwnedTargetPath::event(owned_value_path!("timestamp")),
     kind: OwnedTargetPath::event(owned_value_path!("metadata", "kind")),
     level: OwnedTargetPath::event(owned_value_path!("metadata", "level")),
@@ -809,10 +834,12 @@ impl tracing::field::Visit for LogEvent {
 
 #[cfg(test)]
 mod test {
+    use lookup::event_path;
+    use uuid::Version;
+    use vrl::{btreemap, value};
+
     use super::*;
     use crate::test_util::open_fixture;
-    use lookup::event_path;
-    use vrl::value;
 
     // The following two tests assert that renaming a key has no effect if the
     // keys are equivalent, whether the key exists in the log or not.
@@ -1010,9 +1037,8 @@ mod test {
     fn json_value_to_vector_log_event_to_json_value() {
         const FIXTURE_ROOT: &str = "tests/data/fixtures/log_event";
 
-        std::fs::read_dir(FIXTURE_ROOT)
-            .unwrap()
-            .for_each(|fixture_file| match fixture_file {
+        for fixture_file in std::fs::read_dir(FIXTURE_ROOT).unwrap() {
+            match fixture_file {
                 Ok(fixture_file) => {
                     let path = fixture_file.path();
                     tracing::trace!(?path, "Opening.");
@@ -1024,7 +1050,8 @@ mod test {
                     assert_eq!(serde_value, serde_value_again);
                 }
                 _ => panic!("This test should never read Err'ing test fixtures."),
-            });
+            }
+        }
     }
 
     fn assert_merge_value(
@@ -1146,6 +1173,49 @@ mod test {
         assert_eq!(
             actual,
             vec![("%a.b".into(), 1.into()), ("%c".into(), 2.into())]
+        );
+    }
+
+    #[test]
+    fn skip_array_elements() {
+        let log = LogEvent::from(Value::from(btreemap! {
+            "arr" => [1],
+            "obj" => btreemap! {
+                "arr" => [1,2,3]
+            },
+        }));
+
+        let actual: Vec<(KeyString, Value)> = log
+            .all_event_fields_skip_array_elements()
+            .unwrap()
+            .map(|(s, v)| (s, v.clone()))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("arr".into(), [1].into()),
+                ("obj.arr".into(), [1, 2, 3].into())
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_set_unique_uuid_v4_source_event_id() {
+        // Check if event id is UUID v4
+        let log1 = LogEvent::default();
+        assert_eq!(
+            log1.metadata()
+                .source_event_id()
+                .expect("source_event_id should be auto-generated for new events")
+                .get_version(),
+            Some(Version::Random)
+        );
+
+        // Check if event id is unique on creation
+        let log2 = LogEvent::default();
+        assert_ne!(
+            log1.metadata().source_event_id(),
+            log2.metadata().source_event_id()
         );
     }
 }

@@ -5,24 +5,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::{
+    AddCertToStoreSnafu, AddExtraChainCertSnafu, CaStackPushSnafu, EncodeAlpnProtocolsSnafu,
+    FileOpenFailedSnafu, FileReadFailedSnafu, MaybeTls, NewCaStackSnafu, NewStoreBuilderSnafu,
+    ParsePkcs12Snafu, PrivateKeyParseSnafu, Result, SetAlpnProtocolsSnafu, SetCertificateSnafu,
+    SetPrivateKeySnafu, SetVerifyCertSnafu, TlsError, X509ParseSnafu,
+};
+use cfg_if::cfg_if;
 use lookup::lookup_v2::OptionalValuePath;
 use openssl::{
-    pkcs12::{ParsedPkcs12_2, Pkcs12},
+    pkcs12::Pkcs12,
     pkey::{PKey, Private},
-    ssl::{select_next_proto, AlpnError, ConnectConfiguration, SslContextBuilder, SslVerifyMode},
+    ssl::{AlpnError, ConnectConfiguration, SslContextBuilder, SslVerifyMode, select_next_proto},
     stack::Stack,
-    x509::{store::X509StoreBuilder, X509},
+    x509::{X509, store::X509StoreBuilder},
 };
 use snafu::ResultExt;
 use vector_config::configurable_component;
-
-use super::{
-    AddCertToStoreSnafu, AddExtraChainCertSnafu, CaStackPushSnafu, DerExportSnafu,
-    EncodeAlpnProtocolsSnafu, FileOpenFailedSnafu, FileReadFailedSnafu, MaybeTls, NewCaStackSnafu,
-    NewStoreBuilderSnafu, ParsePkcs12Snafu, Pkcs12Snafu, PrivateKeyParseSnafu, Result,
-    SetAlpnProtocolsSnafu, SetCertificateSnafu, SetPrivateKeySnafu, SetVerifyCertSnafu, TlsError,
-    TlsIdentitySnafu, X509ParseSnafu,
-};
 
 pub const PEM_START_MARKER: &str = "-----BEGIN ";
 
@@ -41,8 +40,9 @@ pub const TEST_PEM_CLIENT_KEY_PATH: &str =
 #[configurable_component]
 #[configurable(metadata(docs::advanced))]
 #[derive(Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsEnableableConfig {
-    /// Whether or not to require TLS for incoming or outgoing connections.
+    /// Whether to require TLS for incoming or outgoing connections.
     ///
     /// When enabled and used for incoming connections, an identity certificate is also required. See `tls.crt_file` for
     /// more information.
@@ -68,7 +68,7 @@ impl TlsEnableableConfig {
     }
 }
 
-/// TlsEnableableConfig for `sources`, adding metadata from the client certificate.
+/// `TlsEnableableConfig` for `sources`, adding metadata from the client certificate.
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
 pub struct TlsSourceConfig {
@@ -92,7 +92,7 @@ pub struct TlsConfig {
     /// If enabled, certificates must not be expired and must be issued by a trusted
     /// issuer. This verification operates in a hierarchical manner, checking that the leaf certificate (the
     /// certificate presented by the client/server) is not only valid, but that the issuer of that certificate is also valid, and
-    /// so on until the verification process reaches a root certificate.
+    /// so on, until the verification process reaches a root certificate.
     ///
     /// Do NOT set this to `false` unless you understand the risks of not verifying the validity of certificates.
     pub verify_certificate: Option<bool>,
@@ -109,7 +109,7 @@ pub struct TlsConfig {
 
     /// Sets the list of supported ALPN protocols.
     ///
-    /// Declare the supported ALPN protocols, which are used during negotiation with peer. They are prioritized in the order
+    /// Declare the supported ALPN protocols, which are used during negotiation with a peer. They are prioritized in the order
     /// that they are defined.
     #[configurable(metadata(docs::examples = "h2"))]
     pub alpn_protocols: Option<Vec<String>>,
@@ -127,7 +127,7 @@ pub struct TlsConfig {
     /// The certificate must be in DER, PEM (X.509), or PKCS#12 format. Additionally, the certificate can be provided as
     /// an inline string in PEM format.
     ///
-    /// If this is set, and is not a PKCS#12 archive, `key_file` must also be set.
+    /// If this is set _and_ is not a PKCS#12 archive, `key_file` must also be set.
     #[serde(alias = "crt_path")]
     #[configurable(metadata(docs::examples = "/path/to/host_certificate.crt"))]
     #[configurable(metadata(docs::human_name = "Certificate File Path"))]
@@ -148,6 +148,14 @@ pub struct TlsConfig {
     #[configurable(metadata(docs::examples = "PassWord1"))]
     #[configurable(metadata(docs::human_name = "Key File Password"))]
     pub key_pass: Option<String>,
+
+    /// Server name to use when using Server Name Indication (SNI).
+    ///
+    /// Only relevant for outgoing connections.
+    #[serde(alias = "server_name")]
+    #[configurable(metadata(docs::examples = "www.example.com"))]
+    #[configurable(metadata(docs::human_name = "Server Name"))]
+    pub server_name: Option<String>,
 }
 
 impl TlsConfig {
@@ -167,24 +175,30 @@ pub struct TlsSettings {
     verify_certificate: bool,
     pub(super) verify_hostname: bool,
     authorities: Vec<X509>,
-    pub(super) identity: Option<IdentityStore>, // openssl::pkcs12::ParsedPkcs12 doesn't impl Clone yet
+    pub(super) identity: Option<IdentityStore>,
     alpn_protocols: Option<Vec<u8>>,
+    server_name: Option<String>,
 }
 
+/// Identity store in PEM format
 #[derive(Clone)]
-pub(super) struct IdentityStore(Vec<u8>, String);
+pub(super) struct IdentityStore {
+    cert: X509,
+    key: PKey<Private>,
+    ca: Option<Vec<X509>>,
+}
 
 impl TlsSettings {
     /// Generate a filled out settings struct from the given optional
     /// option set, interpreted as client options. If `options` is
     /// `None`, the result is set to defaults (ie empty).
-    pub fn from_options(options: &Option<TlsConfig>) -> Result<Self> {
+    pub fn from_options(options: Option<&TlsConfig>) -> Result<Self> {
         Self::from_options_base(options, false)
     }
 
-    pub(super) fn from_options_base(options: &Option<TlsConfig>, for_server: bool) -> Result<Self> {
+    pub(super) fn from_options_base(options: Option<&TlsConfig>, for_server: bool) -> Result<Self> {
         let default = TlsConfig::default();
-        let options = options.as_ref().unwrap_or(&default);
+        let options = options.unwrap_or(&default);
 
         if !for_server {
             if options.verify_certificate == Some(false) {
@@ -193,7 +207,9 @@ impl TlsSettings {
                 );
             }
             if options.verify_hostname == Some(false) {
-                warn!("The `verify_hostname` option is DISABLED, this may lead to security vulnerabilities.");
+                warn!(
+                    "The `verify_hostname` option is DISABLED, this may lead to security vulnerabilities."
+                );
             }
         }
 
@@ -203,40 +219,24 @@ impl TlsSettings {
             authorities: options.load_authorities()?,
             identity: options.load_identity()?,
             alpn_protocols: options.parse_alpn_protocols()?,
+            server_name: options.server_name.clone(),
         })
     }
 
-    /// Returns the identity as PKCS12
-    ///
-    /// # Panics
-    ///
-    /// Panics if the identity is invalid.
-    fn identity(&self) -> Option<ParsedPkcs12_2> {
-        // This data was test-built previously, so we can just use it
-        // here and expect the results will not fail. This can all be
-        // reworked when `openssl::pkcs12::ParsedPkcs12` gains the Clone
-        // impl.
-        self.identity.as_ref().map(|identity| {
-            Pkcs12::from_der(&identity.0)
-                .expect("Could not build PKCS#12 archive from parsed data")
-                .parse2(&identity.1)
-                .expect("Could not parse stored PKCS#12 archive")
-        })
-    }
-
-    /// Returns the identity as PEM data
+    /// Returns the identity as PEM encoded byte arrays
     ///
     /// # Panics
     ///
     /// Panics if the identity is missing, invalid, or the authorities to chain are invalid.
     pub fn identity_pem(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.identity().map(|identity| {
-            let mut cert = identity
-                .cert
-                .expect("Identity required")
-                .to_pem()
+        self.identity.as_ref().map(|identity| {
+            // we have verified correct formatting at ingest time
+            let mut cert = identity.cert.to_pem().expect("Invalid stored identity");
+            let key = identity
+                .key
+                .private_key_to_pem_pkcs8()
                 .expect("Invalid stored identity");
-            if let Some(chain) = identity.ca {
+            if let Some(chain) = identity.ca.as_ref() {
                 for authority in chain {
                     cert.extend(
                         authority
@@ -245,11 +245,6 @@ impl TlsSettings {
                     );
                 }
             }
-            let key = identity
-                .pkey
-                .expect("Private key required")
-                .private_key_to_pem_pkcs8()
-                .expect("Invalid stored private key");
             (cert, key)
         })
     }
@@ -281,18 +276,18 @@ impl TlsSettings {
         } else {
             SslVerifyMode::NONE
         });
-        if let Some(identity) = self.identity() {
-            if let Some(cert) = &identity.cert {
-                context.set_certificate(cert).context(SetCertificateSnafu)?;
-            }
-            if let Some(pkey) = &identity.pkey {
-                context.set_private_key(pkey).context(SetPrivateKeySnafu)?;
-            }
+        if let Some(identity) = &self.identity {
+            context
+                .set_certificate(&identity.cert)
+                .context(SetCertificateSnafu)?;
+            context
+                .set_private_key(&identity.key)
+                .context(SetPrivateKeySnafu)?;
 
-            if let Some(chain) = identity.ca {
+            if let Some(chain) = &identity.ca {
                 for cert in chain {
                     context
-                        .add_extra_chain_cert(cert)
+                        .add_extra_chain_cert(cert.clone())
                         .context(AddExtraChainCertSnafu)?;
                 }
             }
@@ -300,11 +295,21 @@ impl TlsSettings {
         if self.authorities.is_empty() {
             debug!("Fetching system root certs.");
 
-            #[cfg(windows)]
-            load_windows_certs(context).unwrap();
-
-            #[cfg(target_os = "macos")]
-            load_mac_certs(context).unwrap();
+            cfg_if! {
+                if #[cfg(windows)] {
+                    load_windows_certs(context).unwrap();
+                } else if #[cfg(target_os = "macos")] {
+                    cfg_if! { // Panic in release builds, warn in debug builds.
+                        if #[cfg(debug_assertions)] {
+                            if let Err(error) = load_mac_certs(context) {
+                                warn!("Failed to load macOS certs: {error}");
+                            }
+                        } else {
+                            load_mac_certs(context).unwrap();
+                        }
+                    }
+                }
+            }
         } else {
             let mut store = X509StoreBuilder::new().context(NewStoreBuilderSnafu)?;
             for authority in &self.authorities {
@@ -320,8 +325,10 @@ impl TlsSettings {
         if let Some(alpn) = &self.alpn_protocols {
             if for_server {
                 let server_proto = alpn.clone();
+                // See https://github.com/sfackler/rust-openssl/pull/2360.
+                let server_proto_ref: &'static [u8] = Box::leak(server_proto.into_boxed_slice());
                 context.set_alpn_select_callback(move |_, client_proto| {
-                    select_next_proto(server_proto.as_slice(), client_proto).ok_or(AlpnError::NOACK)
+                    select_next_proto(server_proto_ref, client_proto).ok_or(AlpnError::NOACK)
                 });
             } else {
                 context
@@ -333,8 +340,17 @@ impl TlsSettings {
         Ok(())
     }
 
-    pub fn apply_connect_configuration(&self, connection: &mut ConnectConfiguration) {
+    pub fn apply_connect_configuration(
+        &self,
+        connection: &mut ConnectConfiguration,
+    ) -> std::result::Result<(), openssl::error::ErrorStack> {
         connection.set_verify_hostname(self.verify_hostname);
+        if let Some(server_name) = &self.server_name {
+            // Prevent native TLS lib from inferring default SNI using domain name from url.
+            connection.set_use_server_name_indication(false);
+            connection.set_hostname(server_name)?;
+        }
+        Ok(())
     }
 }
 
@@ -349,7 +365,7 @@ impl TlsConfig {
                     |der| X509::from_der(&der).map(|x509| vec![x509]),
                     |pem| {
                         pem.match_indices(PEM_START_MARKER)
-                            .map(|(start, _)| X509::from_pem(pem[start..].as_bytes()))
+                            .map(|(start, _)| X509::from_pem(&pem.as_bytes()[start..]))
                             .collect()
                     },
                 )
@@ -366,7 +382,7 @@ impl TlsConfig {
                 let (data, filename) = open_read(filename, "certificate")?;
                 der_or_pem(
                     data,
-                    |der| self.parse_pkcs12_identity(der),
+                    |der| self.parse_pkcs12_identity(&der),
                     |pem| self.parse_pem_identity(&pem, &filename),
                 )
             }
@@ -395,45 +411,43 @@ impl TlsConfig {
         match &self.key_file {
             None => Err(TlsError::MissingKey),
             Some(key_file) => {
-                let name = crt_file.to_string_lossy().to_string();
                 let mut crt_stack = X509::stack_from_pem(pem.as_bytes())
                     .with_context(|_| X509ParseSnafu { filename: crt_file })?
                     .into_iter();
 
-                let crt = crt_stack.next().ok_or(TlsError::MissingCertificate)?;
-                let key = load_key(key_file, &self.key_pass)?;
+                let cert = crt_stack.next().ok_or(TlsError::MissingCertificate)?;
+                let key = load_key(key_file.as_path(), self.key_pass.as_ref())?;
 
                 let mut ca_stack = Stack::new().context(NewCaStackSnafu)?;
                 for intermediate in crt_stack {
                     ca_stack.push(intermediate).context(CaStackPushSnafu)?;
                 }
-
-                let pkcs12 = Pkcs12::builder()
-                    .ca(ca_stack)
-                    .name(&name)
-                    .pkey(&key)
-                    .cert(&crt)
-                    .build2("")
-                    .context(Pkcs12Snafu)?;
-                let identity = pkcs12.to_der().context(DerExportSnafu)?;
-
-                // Build the resulting parsed PKCS#12 archive,
-                // but don't store it, as it cannot be cloned.
-                // This is just for error checking.
-                pkcs12.parse2("").context(TlsIdentitySnafu)?;
-
-                Ok(Some(IdentityStore(identity, String::new())))
+                let ca: Vec<X509> = ca_stack
+                    .iter()
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect();
+                Ok(Some(IdentityStore {
+                    cert,
+                    key,
+                    ca: Some(ca),
+                }))
             }
         }
     }
 
     /// Parse identity from a DER encoded PKCS#12 archive
-    fn parse_pkcs12_identity(&self, der: Vec<u8>) -> Result<Option<IdentityStore>> {
-        let pkcs12 = Pkcs12::from_der(&der).context(ParsePkcs12Snafu)?;
+    fn parse_pkcs12_identity(&self, der: &[u8]) -> Result<Option<IdentityStore>> {
+        let pkcs12 = Pkcs12::from_der(der).context(ParsePkcs12Snafu)?;
         // Verify password
         let key_pass = self.key_pass.as_deref().unwrap_or("");
-        pkcs12.parse2(key_pass).context(ParsePkcs12Snafu)?;
-        Ok(Some(IdentityStore(der, key_pass.to_string())))
+        let parsed = pkcs12.parse2(key_pass).context(ParsePkcs12Snafu)?;
+        // extract cert, key and ca and store as PEM sow e can return an IdentityStore
+        let cert = parsed.cert.ok_or(TlsError::MissingCertificate)?;
+        let key = parsed.pkey.ok_or(TlsError::MissingKey)?;
+        let ca: Option<Vec<X509>> = parsed
+            .ca
+            .map(|stack| stack.iter().map(std::borrow::ToOwned::to_owned).collect());
+        Ok(Some(IdentityStore { cert, key, ca }))
     }
 }
 
@@ -536,11 +550,11 @@ pub type MaybeTlsSettings = MaybeTls<(), TlsSettings>;
 
 impl MaybeTlsSettings {
     pub fn enable_client() -> Result<Self> {
-        let tls = TlsSettings::from_options_base(&None, false)?;
+        let tls = TlsSettings::from_options_base(None, false)?;
         Ok(Self::Tls(tls))
     }
 
-    pub fn tls_client(config: &Option<TlsConfig>) -> Result<Self> {
+    pub fn tls_client(config: Option<&TlsConfig>) -> Result<Self> {
         Ok(Self::Tls(TlsSettings::from_options_base(config, false)?))
     }
 
@@ -550,13 +564,12 @@ impl MaybeTlsSettings {
     /// should be interpreted as being for a TLS server, which requires
     /// an identity certificate and changes the certificate verification
     /// default to false.
-    pub fn from_config(config: &Option<TlsEnableableConfig>, for_server: bool) -> Result<Self> {
+    pub fn from_config(config: Option<&TlsEnableableConfig>, for_server: bool) -> Result<Self> {
         match config {
             None => Ok(Self::Raw(())), // No config, no TLS settings
             Some(config) => {
                 if config.enabled.unwrap_or(false) {
-                    let tls =
-                        TlsSettings::from_options_base(&Some(config.options.clone()), for_server)?;
+                    let tls = TlsSettings::from_options_base(Some(&config.options), for_server)?;
                     match (for_server, &tls.identity) {
                         // Servers require an identity certificate
                         (true, None) => Err(TlsError::MissingRequiredIdentity),
@@ -584,7 +597,7 @@ impl From<TlsSettings> for MaybeTlsSettings {
 }
 
 /// Load a private key from a named file
-fn load_key(filename: &Path, pass_phrase: &Option<String>) -> Result<PKey<Private>> {
+fn load_key(filename: &Path, pass_phrase: Option<&String>) -> Result<PKey<Private>> {
     let (data, filename) = open_read(filename, "key")?;
     match pass_phrase {
         None => der_or_pem(
@@ -621,10 +634,10 @@ fn der_or_pem<T>(data: Vec<u8>, der_fn: impl Fn(Vec<u8>) -> T, pem_fn: impl Fn(S
 /// file "name" contains a PEM start marker, it is assumed to contain
 /// inline data and is used directly instead of opening a file.
 fn open_read(filename: &Path, note: &'static str) -> Result<(Vec<u8>, PathBuf)> {
-    if let Some(filename) = filename.to_str() {
-        if filename.contains(PEM_START_MARKER) {
-            return Ok((Vec::from(filename), "inline text".into()));
-        }
+    if let Some(filename) = filename.to_str()
+        && filename.contains(PEM_START_MARKER)
+    {
+        return Ok((Vec::from(filename), "inline text".into()));
     }
 
     let mut text = Vec::<u8>::new();
@@ -654,7 +667,7 @@ mod test {
             ..Default::default()
         };
         let settings =
-            TlsSettings::from_options(&Some(options)).expect("Failed to parse alpn_protocols");
+            TlsSettings::from_options(Some(&options)).expect("Failed to parse alpn_protocols");
         assert_eq!(settings.alpn_protocols, Some(vec![2, 104, 50]));
     }
 
@@ -667,7 +680,7 @@ mod test {
             ..Default::default()
         };
         let settings =
-            TlsSettings::from_options(&Some(options)).expect("Failed to load PKCS#12 certificate");
+            TlsSettings::from_options(Some(&options)).expect("Failed to load PKCS#12 certificate");
         assert!(settings.identity.is_some());
         assert_eq!(settings.authorities.len(), 0);
     }
@@ -680,7 +693,7 @@ mod test {
             ..Default::default()
         };
         let settings =
-            TlsSettings::from_options(&Some(options)).expect("Failed to load PEM certificate");
+            TlsSettings::from_options(Some(&options)).expect("Failed to load PEM certificate");
         assert!(settings.identity.is_some());
         assert_eq!(settings.authorities.len(), 0);
     }
@@ -695,7 +708,7 @@ mod test {
             ..Default::default()
         };
         let settings =
-            TlsSettings::from_options(&Some(options)).expect("Failed to load PEM certificate");
+            TlsSettings::from_options(Some(&options)).expect("Failed to load PEM certificate");
         assert!(settings.identity.is_some());
         assert_eq!(settings.authorities.len(), 0);
     }
@@ -706,7 +719,7 @@ mod test {
             ca_file: Some(TEST_PEM_CA_PATH.into()),
             ..Default::default()
         };
-        let settings = TlsSettings::from_options(&Some(options))
+        let settings = TlsSettings::from_options(Some(&options))
             .expect("Failed to load authority certificate");
         assert!(settings.identity.is_none());
         assert_eq!(settings.authorities.len(), 1);
@@ -722,7 +735,7 @@ mod test {
             ca_file: Some(ca.into()),
             ..Default::default()
         };
-        let settings = TlsSettings::from_options(&Some(options))
+        let settings = TlsSettings::from_options(Some(&options))
             .expect("Failed to load authority certificate");
         assert!(settings.identity.is_none());
         assert_eq!(settings.authorities.len(), 1);
@@ -734,7 +747,7 @@ mod test {
             ca_file: Some("tests/data/ca/intermediate_server/certs/ca-chain.cert.pem".into()),
             ..Default::default()
         };
-        let settings = TlsSettings::from_options(&Some(options))
+        let settings = TlsSettings::from_options(Some(&options))
             .expect("Failed to load authority certificate");
         assert!(settings.identity.is_none());
         assert_eq!(settings.authorities.len(), 2);
@@ -746,7 +759,7 @@ mod test {
             ca_file: Some("tests/data/Multi_CA.crt".into()),
             ..Default::default()
         };
-        let settings = TlsSettings::from_options(&Some(options))
+        let settings = TlsSettings::from_options(Some(&options))
             .expect("Failed to load authority certificate");
         assert!(settings.identity.is_none());
         assert_eq!(settings.authorities.len(), 2);
@@ -754,7 +767,7 @@ mod test {
 
     #[test]
     fn from_options_none() {
-        let settings = TlsSettings::from_options(&None).expect("Failed to generate null settings");
+        let settings = TlsSettings::from_options(None).expect("Failed to generate null settings");
         assert!(settings.identity.is_none());
         assert_eq!(settings.authorities.len(), 0);
     }
@@ -765,7 +778,7 @@ mod test {
             key_file: Some(TEST_PEM_KEY_PATH.into()),
             ..Default::default()
         };
-        let error = TlsSettings::from_options(&Some(options))
+        let error = TlsSettings::from_options(Some(&options))
             .expect_err("from_options failed to check certificate");
         assert!(matches!(error, TlsError::MissingCrtKeyFile));
 
@@ -773,17 +786,15 @@ mod test {
             crt_file: Some(TEST_PEM_CRT_PATH.into()),
             ..Default::default()
         };
-        let _error = TlsSettings::from_options(&Some(options))
+        let _error = TlsSettings::from_options(Some(&options))
             .expect_err("from_options failed to check certificate");
         // Actual error is an ASN parse, doesn't really matter
     }
 
     #[test]
     fn from_config_none() {
-        assert!(MaybeTlsSettings::from_config(&None, true).unwrap().is_raw());
-        assert!(MaybeTlsSettings::from_config(&None, false)
-            .unwrap()
-            .is_raw());
+        assert!(MaybeTlsSettings::from_config(None, true).unwrap().is_raw());
+        assert!(MaybeTlsSettings::from_config(None, false).unwrap().is_raw());
     }
 
     #[test]
@@ -797,7 +808,7 @@ mod test {
     #[test]
     fn from_config_fails_without_certificate() {
         let config = make_config(Some(true), false, false);
-        let error = MaybeTlsSettings::from_config(&Some(config), true)
+        let error = MaybeTlsSettings::from_config(Some(&config), true)
             .expect_err("from_config failed to check for a certificate");
         assert!(matches!(error, TlsError::MissingRequiredIdentity));
     }
@@ -815,7 +826,7 @@ mod test {
         for_server: bool,
     ) -> MaybeTlsSettings {
         let config = make_config(enabled, set_crt, set_key);
-        MaybeTlsSettings::from_config(&Some(config), for_server)
+        MaybeTlsSettings::from_config(Some(&config), for_server)
             .expect("Failed to generate settings from config")
     }
 

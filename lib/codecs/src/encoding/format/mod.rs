@@ -3,7 +3,10 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "arrow")]
+mod arrow;
 mod avro;
+mod cef;
 mod common;
 mod csv;
 mod gelf;
@@ -11,24 +14,34 @@ mod json;
 mod logfmt;
 mod native;
 mod native_json;
+#[cfg(feature = "opentelemetry")]
+mod otlp;
 mod protobuf;
 mod raw_message;
 mod text;
 
 use std::fmt::Debug;
 
-pub use self::csv::{CsvSerializer, CsvSerializerConfig};
+#[cfg(feature = "arrow")]
+pub use arrow::{
+    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
+};
 pub use avro::{AvroSerializer, AvroSerializerConfig, AvroSerializerOptions};
+pub use cef::{CefSerializer, CefSerializerConfig};
 use dyn_clone::DynClone;
 pub use gelf::{GelfSerializer, GelfSerializerConfig};
-pub use json::{JsonSerializer, JsonSerializerConfig};
+pub use json::{JsonSerializer, JsonSerializerConfig, JsonSerializerOptions};
 pub use logfmt::{LogfmtSerializer, LogfmtSerializerConfig};
 pub use native::{NativeSerializer, NativeSerializerConfig};
 pub use native_json::{NativeJsonSerializer, NativeJsonSerializerConfig};
+#[cfg(feature = "opentelemetry")]
+pub use otlp::{OtlpSerializer, OtlpSerializerConfig};
 pub use protobuf::{ProtobufSerializer, ProtobufSerializerConfig, ProtobufSerializerOptions};
 pub use raw_message::{RawMessageSerializer, RawMessageSerializerConfig};
 pub use text::{TextSerializer, TextSerializerConfig};
 use vector_core::event::Event;
+
+pub use self::csv::{CsvSerializer, CsvSerializerConfig};
 
 /// Serialize a structured event into a byte frame.
 pub trait Serializer:

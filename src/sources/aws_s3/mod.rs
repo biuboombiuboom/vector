@@ -1,23 +1,25 @@
-use std::{convert::TryInto, io::ErrorKind};
+use std::convert::TryInto;
 
 use async_compression::tokio::bufread;
 use aws_smithy_types::byte_stream::ByteStream;
-use futures::{stream, stream::StreamExt, TryStreamExt};
+use futures::{TryStreamExt, stream, stream::StreamExt};
 use snafu::Snafu;
 use tokio_util::io::StreamReader;
-use vector_lib::codecs::decoding::{
-    DeserializerConfig, FramingConfig, NewlineDelimitedDecoderOptions,
+use vector_lib::{
+    codecs::{
+        NewlineDelimitedDecoderConfig,
+        decoding::{DeserializerConfig, FramingConfig, NewlineDelimitedDecoderOptions},
+    },
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    lookup::owned_value_path,
 };
-use vector_lib::codecs::NewlineDelimitedDecoderConfig;
-use vector_lib::config::{LegacyKey, LogNamespace};
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::owned_value_path;
-use vrl::value::{kind::Collection, Kind};
+use vrl::value::{Kind, kind::Collection};
 
 use super::util::MultilineConfig;
-use crate::codecs::DecodingConfig;
 use crate::{
-    aws::{auth::AwsAuthentication, create_client, create_client_and_region, RegionOrEndpoint},
+    aws::{RegionOrEndpoint, auth::AwsAuthentication, create_client, create_client_and_region},
+    codecs::DecodingConfig,
     common::{s3::S3ClientBuilder, sqs::SqsClientBuilder},
     config::{
         ProxyConfig, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
@@ -130,6 +132,13 @@ pub struct AwsS3Config {
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
+
+    /// Specifies which addressing style to use.
+    ///
+    /// This controls whether the bucket name is in the hostname, or part of the URL.
+    #[serde(default = "default_true")]
+    #[derivative(Default(value = "default_true()"))]
+    pub force_path_style: bool,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -137,6 +146,10 @@ const fn default_framing() -> FramingConfig {
     FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig {
         newline_delimited: NewlineDelimitedDecoderOptions { max_length: None },
     })
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl_generate_config_from_default!(AwsS3Config);
@@ -210,7 +223,7 @@ impl SourceConfig for AwsS3Config {
             schema_definition = schema_definition.unknown_fields(Kind::bytes());
         }
 
-        vec![SourceOutput::new_logs(
+        vec![SourceOutput::new_maybe_logs(
             self.decoding.output_type(),
             schema_definition,
         )]
@@ -232,11 +245,15 @@ impl AwsS3Config {
         let endpoint = self.region.endpoint();
 
         let s3_client = create_client::<S3ClientBuilder>(
+            &S3ClientBuilder {
+                force_path_style: Some(self.force_path_style),
+            },
             &self.auth,
             region.clone(),
             endpoint.clone(),
             proxy,
-            &self.tls_options,
+            self.tls_options.as_ref(),
+            None,
         )
         .await?;
 
@@ -247,11 +264,13 @@ impl AwsS3Config {
         match self.sqs {
             Some(ref sqs) => {
                 let (sqs_client, region) = create_client_and_region::<SqsClientBuilder>(
+                    &SqsClientBuilder {},
                     &self.auth,
                     region.clone(),
                     endpoint,
                     proxy,
-                    &sqs.tls_options,
+                    sqs.tls_options.as_ref(),
+                    sqs.timeout.as_ref(),
                 )
                 .await?;
 
@@ -275,16 +294,8 @@ impl AwsS3Config {
 
 #[derive(Debug, Snafu)]
 enum CreateSqsIngestorError {
-    #[snafu(display("Unable to initialize: {}", source))]
-    Initialize { source: sqs::IngestorNewError },
-    #[snafu(display("Unable to create AWS client: {}", source))]
-    Client { source: crate::Error },
-    #[snafu(display("Unable to create AWS credentials provider: {}", source))]
-    Credentials { source: crate::Error },
     #[snafu(display("Configuration for `sqs` required when strategy=sqs"))]
     ConfigMissing,
-    #[snafu(display("Endpoint is invalid"))]
-    InvalidEndpoint,
 }
 
 /// None if body is empty
@@ -295,10 +306,11 @@ async fn s3_object_decoder(
     content_type: Option<&str>,
     mut body: ByteStream,
 ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
-    let first = if let Some(first) = body.next().await {
-        first
-    } else {
-        return Box::new(tokio::io::empty());
+    let first = match body.next().await {
+        Some(first) => first,
+        _ => {
+            return Box::new(tokio::io::empty());
+        }
     };
 
     let r = tokio::io::BufReader::new(StreamReader::new(
@@ -308,7 +320,7 @@ async fn s3_object_decoder(
                     yield next;
                 }
             }))
-            .map_err(|e| std::io::Error::new(ErrorKind::Other, e)),
+            .map_err(std::io::Error::other),
     ));
 
     let compression = match compression {
@@ -405,10 +417,7 @@ mod test {
             assert_eq!(
                 super::determine_compression(content_encoding, content_type, key),
                 expected,
-                "key={:?} content_encoding={:?} content_type={:?}",
-                key,
-                content_encoding,
-                content_type,
+                "key={key:?} content_encoding={content_encoding:?} content_type={content_type:?}",
             );
         }
     }
@@ -447,29 +456,31 @@ mod integration_tests {
     };
 
     use aws_sdk_s3::Client as S3Client;
-    use aws_sdk_sqs::{types::QueueAttributeName, Client as SqsClient};
+    use aws_sdk_sqs::{Client as SqsClient, types::QueueAttributeName};
     use similar_asserts::assert_eq;
-    use vector_lib::codecs::{decoding::DeserializerConfig, JsonDeserializerConfig};
-    use vector_lib::lookup::path;
+    use vector_lib::{
+        codecs::{JsonDeserializerConfig, decoding::DeserializerConfig},
+        lookup::path,
+    };
     use vrl::value::Value;
 
     use super::*;
     use crate::{
-        aws::{create_client, AwsAuthentication, RegionOrEndpoint},
+        SourceSender,
+        aws::{AwsAuthentication, RegionOrEndpoint, create_client},
         common::sqs::SqsClientBuilder,
         config::{ProxyConfig, SourceConfig, SourceContext},
         event::EventStatus::{self, *},
         line_agg,
         sources::{
-            aws_s3::{sqs::S3Event, S3ClientBuilder},
+            aws_s3::{S3ClientBuilder, sqs::S3Event},
             util::MultilineConfig,
         },
         test_util::{
             collect_n,
-            components::{assert_source_compliance, SOURCE_TAGS},
+            components::{SOURCE_TAGS, assert_source_compliance},
             lines_from_gzip_file, random_lines, trace_init,
         },
-        SourceSender,
     };
 
     fn lines_from_plaintext<P: AsRef<Path>>(path: P) -> Vec<String> {
@@ -508,7 +519,7 @@ mod integration_tests {
             .iter()
             .map(|msg| {
                 // convert to JSON object
-                format!(r#"{{"message": "{}"}}"#, msg)
+                format!(r#"{{"message": "{msg}"}}"#)
             })
             .collect();
 
@@ -904,8 +915,8 @@ mod integration_tests {
             )
             .unwrap();
 
-            s3_event.records[0].s3.bucket.name = bucket.clone();
-            s3_event.records[0].s3.object.key = key.clone();
+            s3_event.records[0].s3.bucket.name.clone_from(&bucket);
+            s3_event.records[0].s3.object.key.clone_from(&key);
 
             // send SQS message (this is usually sent by S3 itself when an object is uploaded)
             // This does not automatically work with localstack and the AWS SDK, so this is done manually
@@ -1022,12 +1033,17 @@ mod integration_tests {
             endpoint: Some(s3_address()),
         };
         let proxy_config = ProxyConfig::default();
+        let force_path_style_value: bool = true;
         create_client::<S3ClientBuilder>(
+            &S3ClientBuilder {
+                force_path_style: Some(force_path_style_value),
+            },
             &auth,
             region_endpoint.region(),
             region_endpoint.endpoint(),
             &proxy_config,
-            &None,
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -1041,11 +1057,13 @@ mod integration_tests {
         };
         let proxy_config = ProxyConfig::default();
         create_client::<SqsClientBuilder>(
+            &SqsClientBuilder {},
             &auth,
             region_endpoint.region(),
             region_endpoint.endpoint(),
             &proxy_config,
-            &None,
+            None,
+            None,
         )
         .await
         .unwrap()

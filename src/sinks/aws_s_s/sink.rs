@@ -1,15 +1,5 @@
 use super::{client::Client, request_builder::SSRequestBuilder, service::SSService};
-use crate::sinks::aws_s_s::retry::SSRetryLogic;
-use crate::sinks::prelude::*;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SqsSinkDefaultBatchSettings;
-
-impl SinkBatchSettings for SqsSinkDefaultBatchSettings {
-    const MAX_EVENTS: Option<usize> = Some(1);
-    const MAX_BYTES: Option<usize> = Some(262_144);
-    const TIMEOUT_SECS: f64 = 1.0;
-}
+use crate::sinks::{aws_s_s::retry::SSRetryLogic, prelude::*};
 
 #[derive(Clone)]
 pub(super) struct SSSink<C, E>

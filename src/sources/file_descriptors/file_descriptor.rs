@@ -1,12 +1,17 @@
-use std::{fs::File, io, os::unix::io::FromRawFd};
+use std::{
+    fs::File,
+    io,
+    os::fd::{FromRawFd as _, IntoRawFd as _, RawFd},
+};
 
-use super::{outputs, FileDescriptorConfig};
-use indoc::indoc;
-use vector_lib::codecs::decoding::{DeserializerConfig, FramingConfig};
-use vector_lib::config::LogNamespace;
-use vector_lib::configurable::configurable_component;
-use vector_lib::lookup::lookup_v2::OptionalValuePath;
+use vector_lib::{
+    codecs::decoding::{DeserializerConfig, FramingConfig},
+    config::LogNamespace,
+    configurable::configurable_component,
+    lookup::lookup_v2::OptionalValuePath,
+};
 
+use super::{FileDescriptorConfig, outputs};
 use crate::{
     config::{GenerateConfig, Resource, SourceConfig, SourceContext, SourceOutput},
     serde::default_decoding,
@@ -67,11 +72,24 @@ impl FileDescriptorConfig for FileDescriptorSourceConfig {
 
 impl GenerateConfig for FileDescriptorSourceConfig {
     fn generate_config() -> toml::Value {
-        toml::from_str(indoc! {r#"
-            fd = 10
-        "#})
+        let fd = null_fd().unwrap();
+        toml::from_str(&format!(
+            r#"
+            fd = {fd}
+            "#
+        ))
         .unwrap()
     }
+}
+
+pub(crate) fn null_fd() -> crate::Result<RawFd> {
+    #[cfg(unix)]
+    const FILENAME: &str = "/dev/null";
+    #[cfg(windows)]
+    const FILENAME: &str = "C:\\NUL";
+    File::open(FILENAME)
+        .map_err(|error| format!("Could not open dummy file at {FILENAME:?}: {error}").into())
+        .map(|file| file.into_raw_fd())
 }
 
 #[async_trait::async_trait]
@@ -101,19 +119,19 @@ impl SourceConfig for FileDescriptorSourceConfig {
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
     use nix::unistd::{close, pipe, write};
     use vector_lib::lookup::path;
+    use vrl::value;
 
     use super::*;
     use crate::{
+        SourceSender,
         config::log_schema,
         test_util::components::{
-            assert_source_compliance, assert_source_error, COMPONENT_ERROR_TAGS, SOURCE_TAGS,
+            COMPONENT_ERROR_TAGS, SOURCE_TAGS, assert_source_compliance, assert_source_error,
         },
-        SourceSender,
     };
-    use futures::StreamExt;
-    use vrl::value;
 
     #[test]
     fn generate_config() {
@@ -193,10 +211,11 @@ mod tests {
                 meta.get(path!("vector", "source_type")).unwrap(),
                 &value!("file_descriptor")
             );
-            assert!(meta
-                .get(path!("vector", "ingest_timestamp"))
-                .unwrap()
-                .is_timestamp());
+            assert!(
+                meta.get(path!("vector", "ingest_timestamp"))
+                    .unwrap()
+                    .is_timestamp()
+            );
 
             let event = stream.next().await;
             let event = event.unwrap();
@@ -227,7 +246,6 @@ mod tests {
             let mut stream = rx;
 
             write(write_fd, b"hello world\nhello world again\n").unwrap();
-            close(write_fd).unwrap();
 
             let context = SourceContext::new_test(tx, None);
             config.build(context).await.unwrap().await.unwrap();

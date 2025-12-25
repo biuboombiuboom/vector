@@ -5,8 +5,8 @@ fn set_secret(
     key: Value,
     secret: Value,
 ) -> std::result::Result<Value, ExpressionError> {
-    let key_str = String::from_utf8_lossy(key.as_bytes().expect("key must be a string"));
-    let secret_str = String::from_utf8_lossy(secret.as_bytes().expect("secret must be a string"));
+    let key_str = key.as_str().expect("key must be a string");
+    let secret_str = secret.as_str().expect("secret must be a string");
 
     ctx.target_mut()
         .insert_secret(key_str.as_ref(), secret_str.as_ref());
@@ -37,11 +37,11 @@ impl Function for SetSecret {
     }
 
     fn examples(&self) -> &'static [Example] {
-        &[Example {
+        &[example!(
             title: "Set the datadog api key",
             source: r#"set_secret("datadog_api_key", "secret-value")"#,
             result: Ok("null"),
-        }]
+        )]
     }
 
     fn compile(
@@ -70,6 +70,6 @@ impl FunctionExpression for SetSecretFn {
     }
 
     fn type_def(&self, _: &TypeState) -> TypeDef {
-        TypeDef::null().infallible()
+        TypeDef::null().infallible().impure()
     }
 }

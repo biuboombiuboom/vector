@@ -1,21 +1,26 @@
 use std::{collections::HashMap, error, pin::Pin, sync::Arc, time::Instant};
 
 use futures::{Stream, StreamExt};
-use vector_common::internal_event::{
-    self, register, CountByteSize, EventsSent, InternalEventHandle as _, Registered, DEFAULT_OUTPUT,
+use vector_common::{
+    EventDataEq,
+    byte_size_of::ByteSizeOf,
+    internal_event::{
+        self, CountByteSize, DEFAULT_OUTPUT, EventsSent, InternalEventHandle as _, Registered,
+        register,
+    },
+    json_size::JsonSize,
 };
-use vector_common::{byte_size_of::ByteSizeOf, json_size::JsonSize, EventDataEq};
 
-use crate::config::{ComponentKey, OutputId};
-use crate::event::EventMutRef;
-use crate::schema::Definition;
 use crate::{
     config,
+    config::{ComponentKey, OutputId},
     event::{
-        into_event_stream, EstimatedJsonEncodedSizeOf, Event, EventArray, EventContainer, EventRef,
+        EstimatedJsonEncodedSizeOf, Event, EventArray, EventContainer, EventMutRef, EventRef,
+        into_event_stream,
     },
     fanout::{self, Fanout},
     schema,
+    schema::Definition,
 };
 
 #[cfg(feature = "lua")]
@@ -114,7 +119,7 @@ dyn_clone::clone_trait_object!(FunctionTransform);
 /// # Invariants
 ///
 /// * It is an illegal invariant to implement `FunctionTransform` for a
-/// `TaskTransform` or vice versa.
+///   `TaskTransform` or vice versa.
 pub trait TaskTransform<T: EventContainer + 'static>: Send + 'static {
     fn transform(
         self: Box<Self>,
@@ -376,7 +381,6 @@ impl TransformOutputsBuf {
     /// # Panics
     ///
     /// Panics if there is no default output.
-    #[cfg(any(feature = "test", test))]
     pub fn drain(&mut self) -> impl Iterator<Item = Event> + '_ {
         self.primary_buffer
             .as_mut()
@@ -389,7 +393,6 @@ impl TransformOutputsBuf {
     /// # Panics
     ///
     /// Panics if there is no output with the given name.
-    #[cfg(any(feature = "test", test))]
     pub fn drain_named(&mut self, name: &str) -> impl Iterator<Item = Event> + '_ {
         self.named_buffers
             .get_mut(name)
@@ -402,12 +405,10 @@ impl TransformOutputsBuf {
     /// # Panics
     ///
     /// Panics if there is no default output.
-    #[cfg(any(feature = "test", test))]
     pub fn take_primary(&mut self) -> OutputBuffer {
         std::mem::take(self.primary_buffer.as_mut().expect("no default output"))
     }
 
-    #[cfg(any(feature = "test", test))]
     pub fn take_all_named(&mut self) -> HashMap<String, OutputBuffer> {
         std::mem::take(&mut self.named_buffers)
     }
@@ -474,7 +475,7 @@ impl OutputBuffer {
         self.0.capacity()
     }
 
-    pub fn first(&self) -> Option<EventRef> {
+    pub fn first(&self) -> Option<EventRef<'_>> {
         self.0.first().and_then(|first| match first {
             EventArray::Logs(l) => l.first().map(Into::into),
             EventArray::Metrics(m) => m.first().map(Into::into),
@@ -482,7 +483,6 @@ impl OutputBuffer {
         })
     }
 
-    #[cfg(any(feature = "test", test))]
     pub fn drain(&mut self) -> impl Iterator<Item = Event> + '_ {
         self.0.drain(..).flat_map(EventArray::into_events)
     }
@@ -499,11 +499,11 @@ impl OutputBuffer {
         Ok(())
     }
 
-    fn iter_events(&self) -> impl Iterator<Item = EventRef> {
+    fn iter_events(&self) -> impl Iterator<Item = EventRef<'_>> {
         self.0.iter().flat_map(EventArray::iter_events)
     }
 
-    fn events_mut(&mut self) -> impl Iterator<Item = EventMutRef> {
+    fn events_mut(&mut self) -> impl Iterator<Item = EventMutRef<'_>> {
         self.0.iter_mut().flat_map(EventArray::iter_events_mut)
     }
 
@@ -522,7 +522,7 @@ impl EventDataEq<Vec<Event>> for OutputBuffer {
     fn event_data_eq(&self, other: &Vec<Event>) -> bool {
         struct Comparator<'a>(EventRef<'a>);
 
-        impl<'a> PartialEq<&Event> for Comparator<'a> {
+        impl PartialEq<&Event> for Comparator<'_> {
             fn eq(&self, that: &&Event) -> bool {
                 self.0.event_data_eq(that)
             }

@@ -2,8 +2,10 @@ use std::{collections::BTreeMap, fmt::Write as _};
 
 use chrono::Utc;
 use indexmap::map::IndexMap;
-use vector_lib::event::metric::{samples_to_buckets, MetricSketch, MetricTags, Quantile};
-use vector_lib::prometheus::parser::{proto, METRIC_NAME_LABEL};
+use vector_lib::{
+    event::metric::{MetricSketch, MetricTags, Quantile, samples_to_buckets},
+    prometheus::parser::{METRIC_NAME_LABEL, proto},
+};
 
 use crate::{
     event::metric::{Metric, MetricKind, MetricValue, StatisticKind},
@@ -256,8 +258,8 @@ impl MetricCollector for StringCollector {
         result.push_str(suffix);
         Self::encode_tags(result, tags, extra);
         _ = match timestamp_millis {
-            None => writeln!(result, " {}", value),
-            Some(timestamp) => writeln!(result, " {} {}", value, timestamp),
+            None => writeln!(result, " {value}"),
+            Some(timestamp) => writeln!(result, " {value} {timestamp}"),
         };
     }
 
@@ -290,10 +292,7 @@ impl StringCollector {
 
     fn encode_header(name: &str, fullname: &str, value: &MetricValue) -> String {
         let r#type = prometheus_metric_type(value).as_str();
-        format!(
-            "# HELP {} {}\n# TYPE {} {}\n",
-            fullname, name, fullname, r#type
-        )
+        format!("# HELP {fullname} {name}\n# TYPE {fullname} {type}\n")
     }
 
     fn format_tag(key: &str, mut value: &str) -> String {
@@ -301,7 +300,7 @@ impl StringCollector {
         let mut result = String::with_capacity(key.len() + value.len() + 3);
         result.push_str(key);
         result.push_str("=\"");
-        while let Some(i) = value.find(|ch| ch == '\\' || ch == '"') {
+        while let Some(i) = value.find(['\\', '"']) {
             result.push_str(&value[..i]);
             result.push('\\');
             // Ugly but works because we know the character at `i` is ASCII
@@ -569,11 +568,11 @@ mod tests {
     fn encodes_set_text() {
         assert_eq!(
             encode_set::<StringCollector>(),
-            indoc! { r#"
+            indoc! { r"
                 # HELP vector_users users
                 # TYPE vector_users gauge
                 vector_users 1 1612325106789
-            "#}
+            "}
         );
     }
 
@@ -601,11 +600,11 @@ mod tests {
     fn encodes_expired_set_text() {
         assert_eq!(
             encode_expired_set::<StringCollector>(),
-            indoc! {r#"
+            indoc! {r"
                 # HELP vector_users users
                 # TYPE vector_users gauge
                 vector_users 0 1612325106789
-            "#}
+            "}
         );
     }
 
@@ -873,11 +872,11 @@ mod tests {
     fn encodes_timestamp_text() {
         assert_eq!(
             encode_timestamp::<StringCollector>(),
-            indoc! {r#"
+            indoc! {r"
                 # HELP temperature temperature
                 # TYPE temperature counter
                 temperature 2 1612325106789
-            "#}
+            "}
         );
     }
 
@@ -943,9 +942,11 @@ mod tests {
     }
 
     /// According to the [spec](https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md?plain=1#L115)
+    ///
     /// > Label names MUST be unique within a LabelSet.
-    /// Prometheus itself will reject the metric with an error. Largely to remain backward compatible with older versions of Vector,
-    /// we only publish the last tag in the list.
+    ///
+    /// Prometheus itself will reject the metric with an error. Largely to remain backward
+    /// compatible with older versions of Vector, we only publish the last tag in the list.
     #[test]
     fn encodes_duplicate_tags() {
         let tags = metric_tags!(

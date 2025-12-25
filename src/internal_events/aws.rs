@@ -1,6 +1,8 @@
 use metrics::counter;
+use vector_lib::NamedInternalEvent;
 use vector_lib::internal_event::InternalEvent;
 
+#[derive(NamedInternalEvent)]
 pub struct AwsBytesSent {
     pub byte_size: usize,
     pub region: Option<aws_types::region::Region>,
@@ -19,9 +21,10 @@ impl InternalEvent for AwsBytesSent {
             region = ?self.region,
         );
         counter!(
-            "component_sent_bytes_total", self.byte_size as u64,
+            "component_sent_bytes_total",
             "protocol" => "https",
             "region" => region,
-        );
+        )
+        .increment(self.byte_size as u64);
     }
 }

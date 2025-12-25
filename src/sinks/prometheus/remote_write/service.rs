@@ -4,7 +4,6 @@ use std::task::{Context, Poll};
 use aws_credential_types::provider::SharedCredentialsProvider;
 #[cfg(feature = "aws-core")]
 use aws_types::region::Region;
-
 use bytes::Bytes;
 use http::Uri;
 
@@ -70,7 +69,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
 
             let response = client.send(http_request).await?;
             let (parts, body) = response.into_parts();
-            let body = hyper::body::to_bytes(body).await?;
+            let body = http_body::Body::collect(body).await?.to_bytes();
             let http_response = hyper::Response::from_parts(parts, body);
 
             if http_response.status().is_success() {
@@ -95,9 +94,9 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
 async fn sign_request(
     request: &mut http::Request<Bytes>,
     credentials_provider: &SharedCredentialsProvider,
-    region: &Option<Region>,
+    region: Option<&Region>,
 ) -> crate::Result<()> {
-    crate::aws::sign_request("aps", request, credentials_provider, region).await
+    crate::aws::sign_request("aps", request, credentials_provider, region, false).await
 }
 
 pub(super) async fn build_request(
@@ -131,7 +130,7 @@ pub(super) async fn build_request(
             Auth::Aws {
                 credentials_provider: provider,
                 region,
-            } => sign_request(&mut request, &provider, &Some(region.clone())).await?,
+            } => sign_request(&mut request, &provider, Some(&region)).await?,
         }
     }
 

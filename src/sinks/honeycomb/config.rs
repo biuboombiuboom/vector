@@ -3,23 +3,22 @@
 use bytes::Bytes;
 use futures::FutureExt;
 use http::{Request, StatusCode, Uri};
-use vector_lib::sensitive_string::SensitiveString;
+use vector_lib::{configurable::configurable_component, sensitive_string::SensitiveString};
 use vrl::value::Kind;
 
+use super::{
+    encoder::HoneycombEncoder, request_builder::HoneycombRequestBuilder,
+    service::HoneycombSvcRequestBuilder, sink::HoneycombSink,
+};
 use crate::{
     http::HttpClient,
     sinks::{
         prelude::*,
         util::{
-            http::{http_response_retry_logic, HttpService},
             BatchConfig, BoxedRawValue,
+            http::{HttpService, http_response_retry_logic},
         },
     },
-};
-
-use super::{
-    encoder::HoneycombEncoder, request_builder::HoneycombRequestBuilder,
-    service::HoneycombSvcRequestBuilder, sink::HoneycombSink,
 };
 
 pub(super) const HTTP_HEADER_HONEYCOMB: &str = "X-Honeycomb-Team";
@@ -28,8 +27,13 @@ pub(super) const HTTP_HEADER_HONEYCOMB: &str = "X-Honeycomb-Team";
 #[configurable_component(sink("honeycomb", "Deliver log events to Honeycomb."))]
 #[derive(Clone, Debug)]
 pub struct HoneycombConfig {
-    // This endpoint is not user-configurable and only exists for testing purposes
-    #[serde(skip, default = "default_endpoint")]
+    /// Honeycomb's endpoint to send logs to
+    #[serde(default = "default_endpoint")]
+    #[configurable(metadata(
+        docs::examples = "https://api.honeycomb.io",
+        docs::examples = "https://api.eu1.honeycomb.io",
+    ))]
+    #[configurable(validation(format = "uri"))]
     pub(super) endpoint: String,
 
     /// The API key that is used to authenticate against Honeycomb.
@@ -55,6 +59,11 @@ pub struct HoneycombConfig {
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     encoding: Transformer,
 
+    /// The compression algorithm to use.
+    #[configurable(derived)]
+    #[serde(default = "Compression::zstd_default")]
+    compression: Compression,
+
     #[configurable(derived)]
     #[serde(
         default,
@@ -65,7 +74,7 @@ pub struct HoneycombConfig {
 }
 
 fn default_endpoint() -> String {
-    "https://api.honeycomb.io/1/batch".to_string()
+    "https://api.honeycomb.io".to_string()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,6 +106,7 @@ impl SinkConfig for HoneycombConfig {
             encoder: HoneycombEncoder {
                 transformer: self.encoding.clone(),
             },
+            compression: self.compression,
         };
 
         let uri = self.build_uri()?;
@@ -104,6 +114,7 @@ impl SinkConfig for HoneycombConfig {
         let honeycomb_service_request_builder = HoneycombSvcRequestBuilder {
             uri: uri.clone(),
             api_key: self.api_key.clone(),
+            compression: self.compression,
         };
 
         let client = HttpClient::new(None, cx.proxy())?;
@@ -136,7 +147,11 @@ impl SinkConfig for HoneycombConfig {
 
 impl HoneycombConfig {
     fn build_uri(&self) -> crate::Result<Uri> {
-        let uri = format!("{}/{}", self.endpoint, self.dataset);
+        let uri = format!(
+            "{}/1/batch/{}",
+            self.endpoint.trim_end_matches('/'),
+            self.dataset
+        );
         uri.parse::<Uri>().map_err(Into::into)
     }
 }
@@ -152,7 +167,7 @@ async fn healthcheck(uri: Uri, api_key: SensitiveString, client: HttpClient) -> 
     let res = client.send(req).await?;
 
     let status = res.status();
-    let body = hyper::body::to_bytes(res.into_body()).await?;
+    let body = http_body::Body::collect(res.into_body()).await?.to_bytes();
 
     if status == StatusCode::BAD_REQUEST {
         Ok(())
@@ -173,10 +188,6 @@ async fn healthcheck(uri: Uri, api_key: SensitiveString, client: HttpClient) -> 
     } else {
         let body = String::from_utf8_lossy(&body[..]);
 
-        Err(format!(
-            "Server returned unexpected error status: {} body: {}",
-            status, body
-        )
-        .into())
+        Err(format!("Server returned unexpected error status: {status} body: {body}").into())
     }
 }

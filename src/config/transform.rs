@@ -1,24 +1,26 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use serde::Serialize;
-use vector_lib::configurable::attributes::CustomAttribute;
-use vector_lib::configurable::{
-    configurable_component,
-    schema::{SchemaGenerator, SchemaObject},
-    Configurable, GenerateError, Metadata, NamedComponent,
-};
 use vector_lib::{
     config::{GlobalOptions, Input, LogNamespace, TransformOutput},
+    configurable::{
+        Configurable, GenerateError, Metadata, NamedComponent,
+        attributes::CustomAttribute,
+        configurable_component,
+        schema::{SchemaGenerator, SchemaObject},
+    },
+    id::Inputs,
     schema,
     transform::Transform,
 };
 
-use super::schema::Options as SchemaOptions;
-use super::OutputId;
-use super::{id::Inputs, ComponentKey};
+use super::{ComponentKey, OutputId, dot_graph::GraphConfig, schema::Options as SchemaOptions};
 use crate::extra_context::ExtraContext;
 
 pub type BoxedTransform = Box<dyn TransformConfig>;
@@ -36,8 +38,10 @@ impl Configurable for BoxedTransform {
         metadata
     }
 
-    fn generate_schema(gen: &RefCell<SchemaGenerator>) -> Result<SchemaObject, GenerateError> {
-        vector_lib::configurable::component::TransformDescription::generate_schemas(gen)
+    fn generate_schema(
+        generator: &RefCell<SchemaGenerator>,
+    ) -> Result<SchemaObject, GenerateError> {
+        vector_lib::configurable::component::TransformDescription::generate_schemas(generator)
     }
 }
 
@@ -55,6 +59,10 @@ pub struct TransformOuter<T>
 where
     T: Configurable + Serialize + 'static,
 {
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub graph: GraphConfig,
+
     #[configurable(derived)]
     pub inputs: Inputs<T>,
 
@@ -74,7 +82,11 @@ where
     {
         let inputs = Inputs::from_iter(inputs);
         let inner = inner.into();
-        TransformOuter { inputs, inner }
+        TransformOuter {
+            inputs,
+            inner,
+            graph: Default::default(),
+        }
     }
 
     pub(super) fn map_inputs<U>(self, f: impl Fn(&T) -> U) -> TransformOuter<U>
@@ -93,6 +105,7 @@ where
         TransformOuter {
             inputs: Inputs::from_iter(inputs),
             inner: self.inner,
+            graph: self.graph,
         }
     }
 }
@@ -152,7 +165,7 @@ impl TransformContext {
         }
     }
 
-    #[cfg(any(test, feature = "test"))]
+    #[cfg(test)]
     pub fn new_test(
         schema_definitions: HashMap<Option<String>, HashMap<OutputId, schema::Definition>>,
     ) -> Self {
@@ -241,6 +254,11 @@ pub trait TransformConfig: DynClone + NamedComponent + core::fmt::Debug + Send +
     /// nested under transforms of a specific type, or if such nesting is fundamentally disallowed.
     fn nestable(&self, _parents: &HashSet<&'static str>) -> bool {
         true
+    }
+
+    /// Gets the files to watch to trigger reload
+    fn files_to_watch(&self) -> Vec<&PathBuf> {
+        Vec::new()
     }
 }
 

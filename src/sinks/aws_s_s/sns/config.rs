@@ -1,18 +1,17 @@
 use aws_sdk_sns::Client as SnsClient;
-
-use crate::aws::RegionOrEndpoint;
-
-use crate::config::{
-    AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
-};
 use vector_lib::configurable::configurable_component;
 
 use super::{
-    client::SnsMessagePublisher, message_deduplication_id, message_group_id, BaseSSSinkConfig,
-    SSRequestBuilder, SSSink,
+    BaseSSSinkConfig, SSRequestBuilder, SSSink, client::SnsMessagePublisher,
+    message_deduplication_id, message_group_id,
 };
-use crate::aws::create_client;
-use crate::aws::ClientBuilder;
+use crate::{
+    aws::{ClientBuilder, RegionOrEndpoint, create_client},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig,
+        SinkContext,
+    },
+};
 
 /// Configuration for the `aws_sns` sink.
 #[configurable_component(sink(
@@ -48,11 +47,13 @@ impl GenerateConfig for SnsSinkConfig {
 impl SnsSinkConfig {
     pub(super) async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<SnsClient> {
         create_client::<SnsClientBuilder>(
+            &SnsClientBuilder {},
             &self.base_config.auth,
             self.region.region(),
             self.region.endpoint(),
             proxy,
-            &self.base_config.tls,
+            self.base_config.tls.as_ref(),
+            None,
         )
         .await
     }
@@ -107,7 +108,7 @@ pub(super) struct SnsClientBuilder;
 impl ClientBuilder for SnsClientBuilder {
     type Client = aws_sdk_sns::client::Client;
 
-    fn build(config: &aws_types::SdkConfig) -> Self::Client {
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
         aws_sdk_sns::client::Client::new(config)
     }
 }

@@ -1,31 +1,30 @@
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use async_graphql::{
-    http::{playground_source, GraphQLPlaygroundConfig, WebSocketProtocols},
     Data, Request, Schema,
+    http::{GraphQLPlaygroundConfig, WebSocketProtocols, playground_source},
 };
-use async_graphql_warp::{graphql_protocol, GraphQLResponse, GraphQLWebSocket};
-use hyper::{server::conn::AddrIncoming, service::make_service_fn, Server as HyperServer};
-use tokio::runtime::Handle;
-use tokio::sync::oneshot;
+use async_graphql_warp::{GraphQLResponse, GraphQLWebSocket, graphql_protocol};
+use hyper::{Server as HyperServer, server::conn::AddrIncoming, service::make_service_fn};
+use tokio::{runtime::Handle, sync::oneshot};
 use tower::ServiceBuilder;
 use tracing::Span;
-use warp::{filters::BoxedFilter, http::Response, ws::Ws, Filter, Reply};
+use vector_lib::tap::topology;
+use warp::{Filter, Reply, filters::BoxedFilter, http::Response, ws::Ws};
 
-use super::{handler, schema, ShutdownTx};
+use super::{handler, schema};
 use crate::{
     config::{self, api},
     http::build_http_trace_layer,
     internal_events::{SocketBindError, SocketMode},
-    topology,
 };
 
 pub struct Server {
-    _shutdown: ShutdownTx,
+    _shutdown: oneshot::Sender<()>,
     addr: SocketAddr,
 }
 
@@ -45,12 +44,11 @@ impl Server {
         let _guard = handle.enter();
 
         let addr = config.api.address.expect("No socket address");
-        let incoming = AddrIncoming::bind(&addr).map_err(|error| {
+        let incoming = AddrIncoming::bind(&addr).inspect_err(|error| {
             emit!(SocketBindError {
                 mode: SocketMode::Tcp,
-                error: &error,
+                error,
             });
-            error
         })?;
 
         let span = Span::current();

@@ -1,8 +1,6 @@
 use std::{collections::HashMap, num::NonZeroUsize};
 
 use bytes::{Bytes, BytesMut};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use snafu::Snafu;
 use tokio_util::codec::Encoder as _;
 use vrl::path::parse_target_path;
@@ -12,14 +10,14 @@ use super::{
     event::{LokiBatchEncoder, LokiEvent, LokiRecord, PartitionKey},
     service::{LokiRequest, LokiRetryLogic, LokiService},
 };
-use crate::sinks::loki::event::LokiBatchEncoding;
 use crate::{
-    http::{get_http_scheme_from_uri, HttpClient},
+    common::expansion::pair_expansion,
+    http::{HttpClient, get_http_scheme_from_uri},
     internal_events::{
         LokiEventUnlabeledError, LokiOutOfOrderEventDroppedError, LokiOutOfOrderEventRewritten,
-        SinkRequestBuildError,
+        LokiTimestampNonParsableEventsDropped, SinkRequestBuildError,
     },
-    sinks::prelude::*,
+    sinks::{loki::event::LokiBatchEncoding, prelude::*},
 };
 
 #[derive(Clone)]
@@ -70,8 +68,6 @@ pub struct LokiRequestBuilder {
 
 #[derive(Debug, Snafu)]
 pub enum RequestBuildError {
-    #[snafu(display("Encoded payload is greater than the max limit."))]
-    PayloadTooBig,
     #[snafu(display("Failed to build payload with error: {}", error))]
     Io { error: std::io::Error },
 }
@@ -136,6 +132,8 @@ pub(super) struct EventEncoder {
     encoder: Encoder<()>,
     labels: HashMap<Template, Template>,
     remove_label_fields: bool,
+    structured_metadata: HashMap<Template, Template>,
+    remove_structured_metadata_fields: bool,
     remove_timestamp: bool,
 }
 
@@ -153,8 +151,7 @@ impl EventEncoder {
                     emit!(TemplateRenderingError {
                         field: Some(
                             format!(
-                                "label_key \"{}\" with label_value \"{}\"",
-                                key_template, value_template
+                                "label_key \"{key_template}\" with label_value \"{value_template}\""
                             )
                             .as_str()
                         ),
@@ -166,8 +163,7 @@ impl EventEncoder {
                     emit!(TemplateRenderingError {
                         field: Some(
                             format!(
-                                "label_value \"{}\" with label_key \"{}\"",
-                                value_template, key_template
+                                "label_value \"{value_template}\" with label_key \"{key_template}\""
                             )
                             .as_str()
                         ),
@@ -180,41 +176,13 @@ impl EventEncoder {
 
             let key_s = key.unwrap();
             let value_s = value.unwrap();
-
-            if let Some(opening_prefix) = key_s.strip_suffix('*') {
-                let output: Result<
-                    serde_json::map::Map<String, serde_json::Value>,
-                    serde_json::Error,
-                > = serde_json::from_str(value_s.clone().as_str());
-
-                if output.is_err() {
-                    warn!(
-                        "Failed to expand dynamic label. value: {}, err: {}",
-                        value_s,
-                        output.err().unwrap()
-                    );
-                    continue;
-                }
-
-                // key_* -> key_one, key_two, key_three
-                // * -> one, two, three
-                for (k, v) in output.unwrap() {
-                    let key = slugify_text(format!("{}{}", opening_prefix, k));
-                    let val = Value::from(v).to_string_lossy().into_owned();
-                    if val == "<null>" {
-                        warn!("Encountered \"null\" value for dynamic label. key: {}", key);
-                        continue;
-                    }
-                    if let Some(prev) = dynamic_labels.insert(key.clone(), val.clone()) {
-                        warn!(
-                            "Encountered duplicated dynamic label. \
-                                key: {}, value: {}, discarded value: {}",
-                            key, val, prev
-                        );
-                    };
-                }
-            } else {
-                static_labels.insert(key_s, value_s);
+            let result = pair_expansion(&key_s, &value_s, &mut static_labels, &mut dynamic_labels);
+            // we just need to check the error since the result have been inserted in the static_pairs or dynamic_pairs
+            if let Err(err) = result {
+                warn!(
+                    "Failed to expand dynamic label. value: {}, err: {}",
+                    value_s, err
+                );
             }
         }
 
@@ -245,15 +213,104 @@ impl EventEncoder {
         }
     }
 
+    fn build_structured_metadata(&self, event: &Event) -> Vec<(String, String)> {
+        let mut static_structured_metadata: HashMap<String, String> = HashMap::new();
+        let mut dynamic_structured_metadata: HashMap<String, String> = HashMap::new();
+
+        for (key_template, value_template) in self.structured_metadata.iter() {
+            let key = key_template.render_string(event);
+            let value = value_template.render_string(event);
+
+            if key.is_err() || value.is_err() {
+                if key.is_err() {
+                    emit!(TemplateRenderingError {
+                        field: Some(
+                            format!(
+                        "structured_metadata_key \"{key_template}\" with structured_metadata_value \"{value_template}\""
+                    )
+                            .as_str()
+                        ),
+                        drop_event: false,
+                        error: key.err().unwrap(),
+                    });
+                }
+                if value.is_err() {
+                    emit!(TemplateRenderingError {
+                        field: Some(
+                            format!(
+                        "structured_metadata_value \"{value_template}\" with structured_metadata_key \"{key_template}\""
+                    )
+                            .as_str()
+                        ),
+                        drop_event: false,
+                        error: value.err().unwrap(),
+                    });
+                }
+                continue;
+            }
+
+            let key_s = key.unwrap();
+            let value_s = value.unwrap();
+            let result = pair_expansion(
+                &key_s,
+                &value_s,
+                &mut static_structured_metadata,
+                &mut dynamic_structured_metadata,
+            );
+            // we just need to check the error since the result have been inserted in the static_pairs or dynamic_pairs
+            if let Err(err) = result {
+                warn!(
+                    "Failed to expand dynamic structured metadata. value: {}, err: {}",
+                    value_s, err
+                );
+            }
+        }
+
+        for (k, v) in static_structured_metadata {
+            if let Some(discarded_v) = dynamic_structured_metadata.insert(k.clone(), v.clone()) {
+                warn!(
+                    "Static structured_metadata overrides dynamic structured_metadata. \
+        key: {}, value: {}, discarded value: {}",
+                    k, v, discarded_v
+                );
+            };
+        }
+
+        Vec::from_iter(dynamic_structured_metadata)
+    }
+
+    fn remove_structured_metadata_fields(&self, event: &mut Event) {
+        if self.remove_structured_metadata_fields {
+            for template in self.structured_metadata.values() {
+                if let Some(fields) = template.get_fields() {
+                    for field in fields {
+                        if let Ok(path) = parse_target_path(field.as_str()) {
+                            event.as_mut_log().remove(&path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn encode_event(&mut self, mut event: Event) -> Option<LokiRecord> {
         let tenant_id = self.key_partitioner.partition(&event);
         let finalizers = event.take_finalizers();
         let json_byte_size = event.estimated_json_encoded_size_of();
-        let mut labels = self.build_labels(&event);
+        let mut labels: Vec<(String, String)> = self.build_labels(&event);
         self.remove_label_fields(&mut event);
+        let structured_metadata: Vec<(String, String)> = self.build_structured_metadata(&event);
+        self.remove_structured_metadata_fields(&mut event);
 
         let timestamp = match event.as_log().get_timestamp() {
-            Some(Value::Timestamp(ts)) => ts.timestamp_nanos_opt().expect("Timestamp out of range"),
+            Some(Value::Timestamp(ts)) => match ts.timestamp_nanos_opt() {
+                Some(timestamp) => timestamp,
+                None => {
+                    finalizers.update_status(EventStatus::Errored);
+                    emit!(LokiTimestampNonParsableEventsDropped);
+                    return None;
+                }
+            },
             _ => chrono::Utc::now()
                 .timestamp_nanos_opt()
                 .expect("Timestamp out of range"),
@@ -284,6 +341,7 @@ impl EventEncoder {
             event: LokiEvent {
                 timestamp,
                 event: bytes.freeze(),
+                structured_metadata: structured_metadata.clone(),
             },
             partition,
             finalizers,
@@ -425,7 +483,9 @@ impl LokiSink {
                 transformer,
                 encoder,
                 labels: config.labels,
+                structured_metadata: config.structured_metadata,
                 remove_label_fields: config.remove_label_fields,
+                remove_structured_metadata_fields: config.remove_structured_metadata_fields,
                 remove_timestamp: config.remove_timestamp,
             },
             batch_settings: config.batch.into_batcher_settings()?,
@@ -500,21 +560,16 @@ impl StreamSink<Event> for LokiSink {
     }
 }
 
-static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9A-Za-z_]").unwrap());
-
-fn slugify_text(input: String) -> String {
-    let result = RE.replace_all(&input, "_");
-    result.to_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, convert::TryFrom};
 
     use futures::stream::StreamExt;
-    use vector_lib::codecs::JsonSerializerConfig;
-    use vector_lib::event::{Event, LogEvent, ObjectMap, Value};
-    use vector_lib::lookup::PathPrefix;
+    use vector_lib::{
+        codecs::JsonSerializerConfig,
+        event::{Event, LogEvent, ObjectMap, Value},
+        lookup::PathPrefix,
+    };
 
     use super::{EventEncoder, KeyPartitioner, RecordFilter};
     use crate::{
@@ -529,7 +584,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
         let mut event = Event::Log(LogEvent::from("hello world"));
@@ -539,8 +596,10 @@ mod tests {
             chrono::Utc::now(),
         );
         let record = encoder.encode_event(event).unwrap();
-        assert!(String::from_utf8_lossy(&record.event.event)
-            .contains(log_schema().timestamp_key().unwrap().to_string().as_str()));
+        assert!(
+            String::from_utf8_lossy(&record.event.event)
+                .contains(log_schema().timestamp_key().unwrap().to_string().as_str())
+        );
         assert_eq!(record.labels.len(), 1);
         assert_eq!(
             record.labels[0],
@@ -572,7 +631,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels,
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
         let mut event = Event::Log(LogEvent::from("hello world"));
@@ -590,8 +651,10 @@ mod tests {
         log.insert("dict", Value::from(test_dict));
 
         let record = encoder.encode_event(event).unwrap();
-        assert!(String::from_utf8_lossy(&record.event.event)
-            .contains(log_schema().timestamp_key().unwrap().to_string().as_str()));
+        assert!(
+            String::from_utf8_lossy(&record.event.event)
+                .contains(log_schema().timestamp_key().unwrap().to_string().as_str())
+        );
         assert_eq!(record.labels.len(), 4);
 
         let labels: HashMap<String, String> = record.labels.into_iter().collect();
@@ -622,7 +685,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels,
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
 
@@ -672,7 +737,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels,
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
 
@@ -710,7 +777,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels,
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
 
@@ -731,7 +800,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: true,
         };
         let mut event = Event::Log(LogEvent::from("hello world"));
@@ -741,8 +812,10 @@ mod tests {
             chrono::Utc::now(),
         );
         let record = encoder.encode_event(event).unwrap();
-        assert!(!String::from_utf8_lossy(&record.event.event)
-            .contains(log_schema().timestamp_key().unwrap().to_string().as_str()));
+        assert!(
+            !String::from_utf8_lossy(&record.event.event)
+                .contains(log_schema().timestamp_key().unwrap().to_string().as_str())
+        );
     }
 
     #[test]
@@ -761,7 +834,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels,
+            structured_metadata: HashMap::default(),
             remove_label_fields: true,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
         let mut event = Event::Log(LogEvent::from("hello world"));
@@ -776,6 +851,75 @@ mod tests {
         assert!(!String::from_utf8_lossy(&record.event.event).contains("value"));
     }
 
+    #[test]
+    fn encoder_with_structured_metadata() -> Result<(), serde_json::Error> {
+        let mut structured_metadata = HashMap::default();
+        structured_metadata.insert(
+            Template::try_from("pod_labels_*").unwrap(),
+            Template::try_from("{{ kubernetes.pod_labels }}").unwrap(),
+        );
+        structured_metadata.insert(
+            Template::try_from("*").unwrap(),
+            Template::try_from("{{ metadata }}").unwrap(),
+        );
+        structured_metadata.insert(
+            Template::try_from("cluster_name").unwrap(),
+            Template::try_from("static_cluster_name").unwrap(),
+        );
+
+        let mut encoder = EventEncoder {
+            key_partitioner: KeyPartitioner::new(None),
+            transformer: Default::default(),
+            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+            labels: HashMap::default(),
+            structured_metadata,
+            remove_label_fields: false,
+            remove_structured_metadata_fields: false,
+            remove_timestamp: false,
+        };
+
+        let message = r#"
+        {
+        	"kubernetes": {
+        		"pod_labels": {
+        			"app": "web-server",
+        			"name": "unicorn"
+        		}
+        	},
+        	"metadata": {
+        		"cluster_name": "operations",
+        		"cluster_environment": "development",
+        		"cluster_version": "1.2.3"
+        	}
+        }
+        "#;
+        let msg: ObjectMap = serde_json::from_str(message)?;
+        let event = Event::Log(LogEvent::from(msg));
+        let record = encoder.encode_event(event).unwrap();
+
+        assert_eq!(record.event.structured_metadata.len(), 5);
+        let structured_metadata: HashMap<String, String> =
+            record.event.structured_metadata.into_iter().collect();
+        assert_eq!(
+            structured_metadata["pod_labels_app"],
+            "web-server".to_string()
+        );
+        assert_eq!(
+            structured_metadata["pod_labels_name"],
+            "unicorn".to_string()
+        );
+        assert_eq!(
+            structured_metadata["cluster_name"],
+            "static_cluster_name".to_string()
+        );
+        assert_eq!(
+            structured_metadata["cluster_environment"],
+            "development".to_string()
+        );
+        assert_eq!(structured_metadata["cluster_version"], "1.2.3".to_string());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn filter_encoder_drop() {
         let mut encoder = EventEncoder {
@@ -783,7 +927,9 @@ mod tests {
             transformer: Default::default(),
             encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
             labels: HashMap::default(),
+            structured_metadata: HashMap::default(),
             remove_label_fields: false,
+            remove_structured_metadata_fields: false,
             remove_timestamp: false,
         };
         let base = chrono::Utc::now();

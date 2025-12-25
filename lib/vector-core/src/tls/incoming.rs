@@ -1,4 +1,3 @@
-use ipnet::IpNet;
 use std::{
     collections::HashMap,
     future::Future,
@@ -8,17 +7,20 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{future::BoxFuture, stream, FutureExt, Stream};
-use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
-use openssl::x509::X509;
+use futures::{FutureExt, Stream, future::BoxFuture, stream};
+use ipnet::IpNet;
+use openssl::{
+    ssl::{Ssl, SslAcceptor, SslMethod},
+    x509::X509,
+};
 use snafu::ResultExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tokio_openssl::SslStream;
-use tonic::transport::{server::Connected, Certificate};
+use tonic::transport::{Certificate, server::Connected};
 
 use super::{
     CreateAcceptorSnafu, HandshakeSnafu, IncomingListenerSnafu, MaybeTlsSettings, MaybeTlsStream,
@@ -28,14 +30,13 @@ use crate::tcp::{self, TcpKeepaliveConfig};
 
 impl TlsSettings {
     pub fn acceptor(&self) -> crate::tls::Result<SslAcceptor> {
-        match self.identity {
-            None => Err(TlsError::MissingRequiredIdentity),
-            Some(_) => {
-                let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
-                    .context(CreateAcceptorSnafu)?;
-                self.apply_context_base(&mut acceptor, true)?;
-                Ok(acceptor.build())
-            }
+        if self.identity.is_none() {
+            Err(TlsError::MissingRequiredIdentity)
+        } else {
+            let mut acceptor =
+                SslAcceptor::mozilla_intermediate(SslMethod::tls()).context(CreateAcceptorSnafu)?;
+            self.apply_context_base(&mut acceptor, true)?;
+            Ok(acceptor.build())
         }
     }
 }
@@ -235,8 +236,8 @@ impl<S> MaybeTlsIncomingStream<S> {
         use super::MaybeTls;
 
         match &mut self.state {
-            StreamState::Accepted(ref mut stream) => Some(match stream {
-                MaybeTls::Raw(ref mut s) => s,
+            StreamState::Accepted(stream) => Some(match stream {
+                MaybeTls::Raw(s) => s,
                 MaybeTls::Tls(s) => s.get_mut(),
             }),
             StreamState::Accepting(_) | StreamState::AcceptError(_) | StreamState::Closed => None,
@@ -321,13 +322,13 @@ impl MaybeTlsIncomingStream<TcpStream> {
                         continue;
                     }
                     Err(error) => {
-                        let error = io::Error::new(io::ErrorKind::Other, error);
+                        let error = io::Error::other(error);
                         this.state = StreamState::AcceptError(error.to_string());
                         Poll::Ready(Err(error))
                     }
                 },
                 StreamState::AcceptError(error) => {
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error.clone())))
+                    Poll::Ready(Err(io::Error::other(error.clone())))
                 }
                 StreamState::Closed => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             };
@@ -370,14 +371,12 @@ impl AsyncWrite for MaybeTlsIncomingStream<TcpStream> {
                     Poll::Pending
                 }
                 Err(error) => {
-                    let error = io::Error::new(io::ErrorKind::Other, error);
+                    let error = io::Error::other(error);
                     this.state = StreamState::AcceptError(error.to_string());
                     Poll::Ready(Err(error))
                 }
             },
-            StreamState::AcceptError(error) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error.clone())))
-            }
+            StreamState::AcceptError(error) => Poll::Ready(Err(io::Error::other(error.clone()))),
             StreamState::Closed => Poll::Ready(Ok(())),
         }
     }

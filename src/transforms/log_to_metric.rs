@@ -1,40 +1,40 @@
-use std::sync::Arc;
-use std::{collections::HashMap, num::ParseFloatError};
+use std::{collections::HashMap, num::ParseFloatError, sync::Arc};
 
 use chrono::Utc;
 use indexmap::IndexMap;
-use vector_lib::configurable::configurable_component;
-use vector_lib::event::LogEvent;
 use vector_lib::{
     config::LogNamespace,
-    event::DatadogMetricOriginMetadata,
+    configurable::configurable_component,
     event::{
-        metric::Sample,
-        metric::{Bucket, Quantile},
+        DatadogMetricOriginMetadata, LogEvent,
+        metric::{Bucket, Quantile, Sample},
     },
 };
-use vrl::path::{parse_target_path, PathParseError};
-use vrl::{event_path, path};
+use vrl::{
+    event_path, path,
+    path::{PathParseError, parse_target_path},
+};
 
-use crate::config::schema::Definition;
-use crate::transforms::log_to_metric::TransformError::PathNotFound;
 use crate::{
+    common::expansion::pair_expansion,
     config::{
         DataType, GenerateConfig, Input, OutputId, TransformConfig, TransformContext,
-        TransformOutput,
+        TransformOutput, schema::Definition,
     },
     event::{
-        metric::{Metric, MetricKind, MetricTags, MetricValue, StatisticKind, TagValue},
         Event, Value,
+        metric::{Metric, MetricKind, MetricTags, MetricValue, StatisticKind, TagValue},
     },
     internal_events::{
-        LogToMetricFieldNullError, LogToMetricParseFloatError,
+        DROP_EVENT, LogToMetricFieldNullError, LogToMetricParseFloatError,
         MetricMetadataInvalidFieldValueError, MetricMetadataMetricDetailsNotFoundError,
-        MetricMetadataParseError, ParserMissingFieldError, DROP_EVENT,
+        MetricMetadataParseError, ParserMissingFieldError,
     },
     schema,
     template::{Template, TemplateRenderingError},
-    transforms::{FunctionTransform, OutputBuffer, Transform},
+    transforms::{
+        FunctionTransform, OutputBuffer, Transform, log_to_metric::TransformError::PathNotFound,
+    },
 };
 
 const ORIGIN_SERVICE_VALUE: u32 = 3;
@@ -45,13 +45,15 @@ const ORIGIN_SERVICE_VALUE: u32 = 3;
 #[serde(deny_unknown_fields)]
 pub struct LogToMetricConfig {
     /// A list of metrics to generate.
-    pub metrics: Vec<MetricConfig>,
-    /// Setting this flag changes the behavior of this transformation.<br />
-    /// <p>Notably the `metrics` field will be ignored.</p>
-    /// <p>All incoming events will be processed and if possible they will be converted to log events.
-    /// Otherwise, only items specified in the 'metrics' field will be processed.</p>
-    /// <pre class="chroma"><code class="language-toml" data-lang="toml">use serde_json::json;
-    /// let json_event = json!({
+    pub metrics: Option<Vec<MetricConfig>>,
+
+    /// Setting this flag changes the behavior of this transformation.
+    /// Notably the `metrics` field will be ignored.
+    /// All incoming events will be processed and if possible they will be converted to log events.
+    /// Otherwise, only items specified in the `metrics` field will be processed.
+    ///
+    /// Example:
+    /// <pre class="chroma"><code class="language-toml" data-lang="toml">{
     ///     "counter": {
     ///         "value": 10.0
     ///     },
@@ -61,10 +63,10 @@ pub struct LogToMetricConfig {
     ///         "env": "test_env",
     ///         "host": "localhost"
     ///     }
-    /// });
+    /// }
     /// </code></pre>
     ///
-    /// This is an example JSON representation of a counter with the following properties:
+    /// This is a JSON representation of a counter with the following properties:
     ///
     /// - `counter`: An object with a single property `value` representing the counter value, in this case, `10.0`).
     /// - `kind`: A string indicating the kind of counter, in this case, "incremental".
@@ -109,8 +111,11 @@ pub struct MetricConfig {
     pub namespace: Option<Template>,
 
     /// Tags to apply to the metric.
+    ///
+    /// Both keys and values can be templated, allowing you to attach dynamic tags to events.
+    ///
     #[configurable(metadata(docs::additional_props_description = "A metric tag."))]
-    pub tags: Option<IndexMap<String, TagConfig>>,
+    pub tags: Option<IndexMap<Template, TagConfig>>,
 
     #[configurable(derived)]
     #[serde(flatten)]
@@ -169,13 +174,14 @@ const fn default_kind() -> MetricKind {
 
 #[derive(Debug, Clone)]
 pub struct LogToMetric {
-    config: LogToMetricConfig,
+    pub metrics: Vec<MetricConfig>,
+    pub all_metrics: bool,
 }
 
 impl GenerateConfig for LogToMetricConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            metrics: vec![MetricConfig {
+            metrics: Some(vec![MetricConfig {
                 field: "field_name".try_into().expect("Fixed template"),
                 name: None,
                 namespace: None,
@@ -184,7 +190,7 @@ impl GenerateConfig for LogToMetricConfig {
                     increment_by_value: false,
                     kind: MetricKind::Incremental,
                 }),
-            }],
+            }]),
             all_metrics: Some(true),
         })
         .unwrap()
@@ -195,7 +201,10 @@ impl GenerateConfig for LogToMetricConfig {
 #[typetag::serde(name = "log_to_metric")]
 impl TransformConfig for LogToMetricConfig {
     async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
-        Ok(Transform::function(LogToMetric::new(self.clone())))
+        Ok(Transform::function(LogToMetric {
+            metrics: self.metrics.clone().unwrap_or_default(),
+            all_metrics: self.all_metrics.unwrap_or_default(),
+        }))
     }
 
     fn input(&self) -> Input {
@@ -217,12 +226,6 @@ impl TransformConfig for LogToMetricConfig {
     }
 }
 
-impl LogToMetric {
-    pub const fn new(config: LogToMetricConfig) -> Self {
-        LogToMetric { config }
-    }
-}
-
 /// Kinds of TranformError for Parsing
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -237,7 +240,7 @@ pub enum TransformParseErrorKind {
 
 impl std::fmt::Display for TransformParseErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -262,6 +265,11 @@ enum TransformError {
         error: ParseFloatError,
     },
     TemplateRenderingError(TemplateRenderingError),
+    PairExpansionError {
+        key: String,
+        value: String,
+        error: serde_json::Error,
+    },
 }
 
 fn render_template(template: &Template, event: &Event) -> Result<String, TransformError> {
@@ -271,9 +279,11 @@ fn render_template(template: &Template, event: &Event) -> Result<String, Transfo
 }
 
 fn render_tags(
-    tags: &Option<IndexMap<String, TagConfig>>,
+    tags: &Option<IndexMap<Template, TagConfig>>,
     event: &Event,
 ) -> Result<Option<MetricTags>, TransformError> {
+    let mut static_tags: HashMap<String, String> = HashMap::new();
+    let mut dynamic_tags: HashMap<String, String> = HashMap::new();
     Ok(match tags {
         None => None,
         Some(tags) => {
@@ -281,14 +291,37 @@ fn render_tags(
             for (name, config) in tags {
                 match config {
                     TagConfig::Plain(template) => {
-                        render_tag_into(event, name, template, &mut result)?
+                        render_tag_into(
+                            event,
+                            name,
+                            template.as_ref(),
+                            &mut result,
+                            &mut static_tags,
+                            &mut dynamic_tags,
+                        )?;
                     }
                     TagConfig::Multi(vec) => {
                         for template in vec {
-                            render_tag_into(event, name, template, &mut result)?;
+                            render_tag_into(
+                                event,
+                                name,
+                                template.as_ref(),
+                                &mut result,
+                                &mut static_tags,
+                                &mut dynamic_tags,
+                            )?;
                         }
                     }
                 }
+            }
+            for (k, v) in static_tags {
+                if let Some(discarded_v) = dynamic_tags.insert(k.clone(), v.clone()) {
+                    warn!(
+                        "Static tags overrides dynamic tags. \
+                key: {}, value: {:?}, discarded value: {:?}",
+                        k, v, discarded_v
+                    );
+                };
             }
             result.as_option()
         }
@@ -297,26 +330,45 @@ fn render_tags(
 
 fn render_tag_into(
     event: &Event,
-    name: &str,
-    template: &Option<Template>,
+    key_template: &Template,
+    value_template: Option<&Template>,
     result: &mut MetricTags,
+    static_tags: &mut HashMap<String, String>,
+    dynamic_tags: &mut HashMap<String, String>,
 ) -> Result<(), TransformError> {
-    let value = match template {
-        None => TagValue::Bare,
+    let key = match render_template(key_template, event) {
+        Ok(key_s) => key_s,
+        Err(TransformError::TemplateRenderingError(err)) => {
+            emit!(crate::internal_events::TemplateRenderingError {
+                error: err,
+                drop_event: false,
+                field: Some(key_template.get_ref()),
+            });
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    match value_template {
+        None => {
+            result.insert(key, TagValue::Bare);
+        }
         Some(template) => match render_template(template, event) {
-            Ok(result) => TagValue::Value(result),
-            Err(TransformError::TemplateRenderingError(error)) => {
+            Ok(value) => {
+                let expanded_pairs = pair_expansion(&key, &value, static_tags, dynamic_tags)
+                    .map_err(|error| TransformError::PairExpansionError { key, value, error })?;
+                result.extend(expanded_pairs);
+            }
+            Err(TransformError::TemplateRenderingError(value_error)) => {
                 emit!(crate::internal_events::TemplateRenderingError {
-                    error,
+                    error: value_error,
                     drop_event: false,
-                    field: Some(name),
+                    field: Some(template.get_ref()),
                 });
                 return Ok(());
             }
             Err(other) => return Err(other),
         },
     };
-    result.insert(name.to_string(), value);
     Ok(())
 }
 
@@ -568,7 +620,7 @@ fn get_distribution_value(log: &LogEvent) -> Result<MetricValue, TransformError>
         None => {
             return Err(TransformError::PathNotFound {
                 path: "distribution.statistic".to_string(),
-            })
+            });
         }
     };
     let statistic_kind = match statistic_str.as_str() {
@@ -741,27 +793,27 @@ fn to_metrics(event: &Event) -> Result<Metric, TransformError> {
         None => {
             return Err(TransformError::PathNotFound {
                 path: "name".to_string(),
-            })
+            });
         }
     };
 
-    let tags = &mut MetricTags::default();
+    let mut tags = MetricTags::default();
 
-    if let Some(els) = log.get(event_path!("tags")) {
-        if let Some(el) = els.as_object() {
-            for (key, value) in el {
-                tags.insert(key.to_string(), bytes_to_str(value));
-            }
+    if let Some(els) = log.get(event_path!("tags"))
+        && let Some(el) = els.as_object()
+    {
+        for (key, value) in el {
+            tags.insert(key.to_string(), bytes_to_str(value));
         }
     }
-    let tags_result = Some(tags.clone());
+    let tags_result = Some(tags);
 
     let kind_str = match try_get_string_from_log(log, "kind")? {
         Some(n) => n,
         None => {
             return Err(TransformError::PathNotFound {
                 path: "kind".to_string(),
-            })
+            });
         }
     };
 
@@ -795,23 +847,22 @@ fn to_metrics(event: &Event) -> Result<Metric, TransformError> {
 
     let value = value.ok_or(TransformError::MetricDetailsNotFound)?;
 
-    Ok(
-        Metric::new_with_metadata(name, kind, value, log.metadata().clone())
-            .with_namespace(try_get_string_from_log(log, "namespace")?)
-            .with_tags(tags_result)
-            .with_timestamp(timestamp),
-    )
+    let mut metric = Metric::new_with_metadata(name, kind, value, log.metadata().clone())
+        .with_tags(tags_result)
+        .with_timestamp(timestamp);
+
+    if let Ok(namespace) = try_get_string_from_log(log, "namespace") {
+        metric = metric.with_namespace(namespace);
+    }
+
+    Ok(metric)
 }
 
 impl FunctionTransform for LogToMetric {
     fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
         // Metrics are "all or none" for a specific log. If a single fails, none are produced.
-        let mut buffer = Vec::with_capacity(self.config.metrics.len());
-        if self
-            .config
-            .all_metrics
-            .is_some_and(|all_metrics| all_metrics)
-        {
+        let mut buffer = Vec::with_capacity(self.metrics.len());
+        if self.all_metrics {
             match to_metrics(&event) {
                 Ok(metric) => {
                     output.push(Event::Metric(metric));
@@ -835,15 +886,23 @@ impl FunctionTransform for LogToMetric {
                                 kind: &kind.to_string(),
                             })
                         }
-                        TransformError::MetricDetailsNotFound {} => {
+                        TransformError::MetricDetailsNotFound => {
                             emit!(MetricMetadataMetricDetailsNotFoundError {})
+                        }
+                        TransformError::PairExpansionError { key, value, error } => {
+                            emit!(crate::internal_events::PairExpansionError {
+                                key: &key,
+                                value: &value,
+                                drop_event: true,
+                                error
+                            })
                         }
                         _ => {}
                     };
                 }
             }
         } else {
-            for config in self.config.metrics.iter() {
+            for config in self.metrics.iter() {
                 match to_metric_with_config(config, &event) {
                     Ok(metric) => {
                         buffer.push(Event::Metric(metric));
@@ -873,6 +932,14 @@ impl FunctionTransform for LogToMetric {
                                     field: None,
                                 })
                             }
+                            TransformError::PairExpansionError { key, value, error } => {
+                                emit!(crate::internal_events::PairExpansionError {
+                                    key: &key,
+                                    value: &value,
+                                    drop_event: true,
+                                    error
+                                })
+                            }
                             _ => {}
                         };
                         // early return to prevent the partial buffer from being sent
@@ -891,24 +958,27 @@ impl FunctionTransform for LogToMetric {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use chrono::{DateTime, Timelike, Utc, offset::TimeZone};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use vector_lib::{
+        config::ComponentKey,
+        event::{EventMetadata, ObjectMap},
+        metric_tags,
+    };
+
     use super::*;
-    use crate::test_util::components::assert_transform_compliance;
-    use crate::transforms::test::create_topology;
     use crate::{
         config::log_schema,
         event::{
-            metric::{Metric, MetricKind, MetricValue, StatisticKind},
             Event, LogEvent,
+            metric::{Metric, MetricKind, MetricValue, StatisticKind},
         },
+        test_util::components::assert_transform_compliance,
+        transforms::test::create_topology,
     };
-    use chrono::{offset::TimeZone, DateTime, Timelike, Utc};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use vector_lib::config::ComponentKey;
-    use vector_lib::event::EventMetadata;
-    use vector_lib::metric_tags;
 
     #[test]
     fn generate_config() {
@@ -1071,6 +1141,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn count_http_requests_with_tags_expansion() {
+        let config = parse_config(
+            r#"
+            [[metrics]]
+            type = "counter"
+            field = "message"
+            name = "http_requests_total"
+            namespace = "app"
+            tags = {"*" = "{{ dict }}"}
+            "#,
+        );
+
+        let mut event = create_event("message", "i am log");
+        let log = event.as_mut_log();
+
+        let mut test_dict = ObjectMap::default();
+        test_dict.insert("one".into(), Value::from("foo"));
+        test_dict.insert("two".into(), Value::from("baz"));
+        log.insert("dict", Value::from(test_dict));
+
+        let mut metadata =
+            event
+                .metadata()
+                .clone()
+                .with_origin_metadata(DatadogMetricOriginMetadata::new(
+                    None,
+                    None,
+                    Some(ORIGIN_SERVICE_VALUE),
+                ));
+        // definitions aren't valid for metrics yet, it's just set to the default (anything).
+        metadata.set_schema_definition(&Arc::new(Definition::any()));
+        metadata.set_upstream_id(Arc::new(OutputId::from("transform")));
+        metadata.set_source_id(Arc::new(ComponentKey::from("in")));
+
+        let metric = do_transform(config, event).await.unwrap();
+
+        assert_eq!(
+            metric.into_metric(),
+            Metric::new_with_metadata(
+                "http_requests_total",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 1.0 },
+                metadata,
+            )
+            .with_namespace(Some("app"))
+            .with_tags(Some(metric_tags!(
+                "one" => "foo",
+                "two" => "baz",
+            )))
+            .with_timestamp(Some(ts()))
+        );
+    }
+    #[tokio::test]
+    async fn count_http_requests_with_colliding_dynamic_tags() {
+        let config = parse_config(
+            r#"
+            [[metrics]]
+            type = "counter"
+            field = "message"
+            name = "http_requests_total"
+            namespace = "app"
+            tags = {"l1_*" = "{{ map1 }}", "*" = "{{ map2 }}"}
+            "#,
+        );
+
+        let mut event = create_event("message", "i am log");
+        let log = event.as_mut_log();
+
+        let mut map1 = ObjectMap::default();
+        map1.insert("key1".into(), Value::from("val1"));
+        log.insert("map1", Value::from(map1));
+
+        let mut map2 = ObjectMap::default();
+        map2.insert("l1_key1".into(), Value::from("val2"));
+        log.insert("map2", Value::from(map2));
+
+        let mut metadata =
+            event
+                .metadata()
+                .clone()
+                .with_origin_metadata(DatadogMetricOriginMetadata::new(
+                    None,
+                    None,
+                    Some(ORIGIN_SERVICE_VALUE),
+                ));
+        // definitions aren't valid for metrics yet, it's just set to the default (anything).
+        metadata.set_schema_definition(&Arc::new(Definition::any()));
+        metadata.set_upstream_id(Arc::new(OutputId::from("transform")));
+        metadata.set_source_id(Arc::new(ComponentKey::from("in")));
+
+        let metric = do_transform(config, event).await.unwrap().into_metric();
+        let tags = metric.tags().expect("Metric should have tags");
+
+        assert_eq!(tags.iter_single().collect::<Vec<_>>()[0].0, "l1_key1");
+
+        assert_eq!(tags.iter_all().count(), 2);
+        for (name, value) in tags.iter_all() {
+            assert_eq!(name, "l1_key1");
+            assert!(value == Some("val1") || value == Some("val2"));
+        }
+    }
+    #[tokio::test]
     async fn multi_value_tags_yaml() {
         // Have to use YAML to represent bare tags
         let config = parse_yaml_config(
@@ -1096,6 +1268,40 @@ mod tests {
         for (name, value) in tags.iter_all() {
             assert_eq!(name, "tag");
             assert!(value.is_none() || value == Some("one") || value == Some("two"));
+        }
+    }
+    #[tokio::test]
+    async fn multi_value_tags_expansion_yaml() {
+        // Have to use YAML to represent bare tags
+        let config = parse_yaml_config(
+            r#"
+            metrics:
+            - field: "message"
+              type: "counter"
+              tags:
+                "*": "{{dict}}"
+            "#,
+        );
+
+        let mut event = create_event("message", "I am log");
+        let log = event.as_mut_log();
+
+        let mut test_dict = ObjectMap::default();
+        test_dict.insert("one".into(), Value::from(vec!["foo", "baz"]));
+        log.insert("dict", Value::from(test_dict));
+
+        let metric = do_transform(config, event).await.unwrap().into_metric();
+        let tags = metric.tags().expect("Metric should have tags");
+
+        assert_eq!(
+            tags.iter_single().collect::<Vec<_>>(),
+            vec![("one", "[\"foo\",\"baz\"]")]
+        );
+
+        assert_eq!(tags.iter_all().count(), 1);
+        for (name, value) in tags.iter_all() {
+            assert_eq!(name, "one");
+            assert_eq!(value, Some("[\"foo\",\"baz\"]"));
         }
     }
 
@@ -1608,11 +1814,19 @@ mod tests {
     }
 
     //  Metric Metadata Tests
+    //
     fn create_log_event(json_str: &str) -> Event {
+        create_log_event_with_namespace(json_str, Some("test_namespace"))
+    }
+
+    fn create_log_event_with_namespace(json_str: &str, namespace: Option<&str>) -> Event {
         let mut log_value: Value =
             serde_json::from_str(json_str).expect("JSON was not well-formatted");
         log_value.insert("timestamp", ts());
-        log_value.insert("namespace", "test_namespace");
+
+        if let Some(namespace) = namespace {
+            log_value.insert("namespace", namespace);
+        }
 
         let mut metadata = EventMetadata::default();
         metadata.set_source_id(Arc::new(ComponentKey::from("in")));
@@ -1623,12 +1837,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_gauge() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "gauge": {
@@ -1662,12 +1874,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_histogram() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "histogram": {
@@ -1741,12 +1951,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_distribution_histogram() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "distribution": {
@@ -1802,12 +2010,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_distribution_summary() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "distribution": {
@@ -1863,12 +2069,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_summary() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "summary": {
@@ -1926,12 +2130,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_counter() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "counter": {
@@ -1965,12 +2167,10 @@ mod tests {
 
     #[tokio::test]
     async fn transform_set() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
 
         let json_str = r#"{
           "set": {
@@ -1996,6 +2196,42 @@ mod tests {
                 metric.metadata().clone(),
             )
             .with_namespace(Some("test_namespace"))
+            .with_tags(Some(metric_tags!(
+                "env" => "test_env",
+                "host" => "localhost",
+            )))
+            .with_timestamp(Some(ts()))
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_all_metrics_optional_namespace() {
+        let config = LogToMetricConfig {
+            metrics: None,
+            all_metrics: Some(true),
+        };
+
+        let json_str = r#"{
+          "counter": {
+            "value": 10.0
+          },
+          "kind": "incremental",
+          "name": "test.transform.counter",
+          "tags": {
+            "env": "test_env",
+            "host": "localhost"
+          }
+        }"#;
+        let log = create_log_event_with_namespace(json_str, None);
+        let metric = do_transform(config, log.clone()).await.unwrap();
+        assert_eq!(
+            *metric.as_metric(),
+            Metric::new_with_metadata(
+                "test.transform.counter",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 10.0 },
+                metric.metadata().clone(),
+            )
             .with_tags(Some(metric_tags!(
                 "env" => "test_env",
                 "host" => "localhost",

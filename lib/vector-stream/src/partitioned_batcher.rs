@@ -3,22 +3,22 @@ use std::{
     hash::{BuildHasherDefault, Hash},
     num::NonZeroUsize,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
 use futures::stream::{Fuse, Stream, StreamExt};
 use pin_project::pin_project;
-use tokio_util::time::{delay_queue::Key, DelayQueue};
+use tokio_util::time::{DelayQueue, delay_queue::Key};
 use twox_hash::XxHash64;
 use vector_common::byte_size_of::ByteSizeOf;
 use vector_core::{partition::Partitioner, time::KeyedTimer};
 
 use crate::batcher::{
+    BatchConfig,
     config::BatchConfigParts,
     data::BatchData,
     limiter::{ByteSizeOfItemSize, ItemBatchSize, SizeLimit},
-    BatchConfig,
 };
 
 /// A `KeyedTimer` based on `DelayQueue`.
@@ -75,10 +75,11 @@ where
             // This is a yet-unseen item key, so create a new expiration
             // entry.
             let expiration_key = self.expirations.insert(item_key.clone(), self.timeout);
-            assert!(self
-                .expiration_map
-                .insert(item_key, expiration_key)
-                .is_none());
+            assert!(
+                self.expiration_map
+                    .insert(item_key, expiration_key)
+                    .is_none()
+            );
         }
     }
 
@@ -355,15 +356,15 @@ mod test {
         time::Duration,
     };
 
-    use futures::{stream, Stream};
+    use futures::{Stream, stream};
     use pin_project::pin_project;
     use proptest::prelude::*;
-    use tokio::{pin, time::advance};
+    use tokio::time::advance;
     use vector_core::{partition::Partitioner, time::KeyedTimer};
 
     use crate::{
-        partitioned_batcher::{ExpirationQueue, PartitionedBatcher},
         BatcherSettings,
+        partitioned_batcher::{ExpirationQueue, PartitionedBatcher},
     };
 
     #[derive(Debug)]
@@ -454,7 +455,7 @@ mod test {
     }
 
     fn arb_partitioner() -> impl Strategy<Value = TestPartitioner> {
-        (1..u8::max_value(),).prop_map(|(ks,)| TestPartitioner {
+        (1..u8::MAX,).prop_map(|(ks,)| TestPartitioner {
             key_space: NonZeroU8::new(ks).unwrap(),
         })
     }
@@ -462,7 +463,7 @@ mod test {
     proptest! {
         #[test]
         fn size_hint_eq(stream: Vec<u64>,
-                        item_limit in 1..u16::max_value(),
+                        item_limit in 1..u16::MAX,
                         allocation_limit in 8..128,
                         partitioner in arb_partitioner(),
                         timer in arb_timer()) {
@@ -488,7 +489,7 @@ mod test {
     proptest! {
         #[test]
         fn batch_item_size_leq_limit(stream: Vec<u64>,
-                                     item_limit in 1..u16::max_value(),
+                                     item_limit in 1..u16::MAX,
                                      allocation_limit in 8..128,
                                      partitioner in arb_partitioner(),
                                      timer in arb_timer()) {
@@ -556,7 +557,7 @@ mod test {
     proptest! {
         #[test]
         fn batch_does_not_reorder(stream: Vec<u64>,
-                                  item_limit in 1..u16::max_value(),
+                                  item_limit in 1..u16::MAX,
                                   allocation_limit in 8..128,
                                   partitioner in arb_partitioner(),
                                   timer in arb_timer()) {
@@ -602,7 +603,7 @@ mod test {
     proptest! {
         #[test]
         fn batch_does_not_lose_items(stream: Vec<u64>,
-                                     item_limit in 1..u16::max_value(),
+                                     item_limit in 1..u16::MAX,
                                      allocation_limit in 8..128,
                                      partitioner in arb_partitioner(),
                                      timer in arb_timer()) {
@@ -645,7 +646,7 @@ mod test {
         // Asserts that ExpirationQueue properly implements KeyedTimer. We are
         // primarily concerned with whether expiration is properly observed.
         let timeout = Duration::from_millis(100); // 1/10 of a second, an
-                                                  // eternity
+        // eternity
 
         let mut expiration_queue: ExpirationQueue<u8> = ExpirationQueue::new(timeout);
 

@@ -1,9 +1,10 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use pulsar::{Error as PulsarError, Pulsar, TokioExecutor};
+use pulsar::{Pulsar, TokioExecutor};
 use serde::Serialize;
 use snafu::Snafu;
-use std::collections::HashMap;
 use vrl::value::KeyString;
 
 use super::{
@@ -16,7 +17,9 @@ use crate::sinks::prelude::*;
 #[snafu(visibility(pub(crate)))]
 pub(crate) enum BuildError {
     #[snafu(display("creating pulsar producer failed: {}", source))]
-    CreatePulsarSink { source: PulsarError },
+    CreatePulsarSink {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub(crate) struct PulsarSink {

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lookup::lookup_v2::TargetPath;
-use lookup::{owned_value_path, OwnedTargetPath, OwnedValuePath, PathPrefix};
-use vrl::value::{kind::Collection, Kind};
+use lookup::{
+    OwnedTargetPath, OwnedValuePath, PathPrefix, lookup_v2::TargetPath, owned_value_path,
+};
+use vrl::value::{Kind, kind::Collection};
 
-use crate::config::{log_schema, LegacyKey, LogNamespace};
+use crate::config::{LegacyKey, LogNamespace, log_schema};
 
 /// The definition of a schema.
 ///
@@ -381,7 +382,7 @@ impl Definition {
     /// # Panics
     ///
     /// This method panics if the provided path points to an unknown location in the collection.
-    fn add_meaning(&mut self, target_path: OwnedTargetPath, meaning: &str) {
+    pub fn add_meaning(&mut self, target_path: OwnedTargetPath, meaning: &str) {
         self.try_with_meaning(target_path, meaning)
             .unwrap_or_else(|err| panic!("{}", err));
     }
@@ -537,7 +538,7 @@ impl Definition {
 
 #[cfg(any(test, feature = "test"))]
 mod test_utils {
-    use super::*;
+    use super::{Definition, Kind};
     use crate::event::{Event, LogEvent};
 
     impl Definition {
@@ -552,7 +553,8 @@ mod test_utils {
 
                 let actual_kind = Kind::from(log.value());
                 if let Err(path) = self.event_kind.is_superset(&actual_kind) {
-                    return Result::Err(format!("Event value doesn't match at path: {}\n\nEvent type at path = {:?}\n\nDefinition at path = {:?}",
+                    return Result::Err(format!(
+                        "Event value doesn't match at path: {}\n\nEvent type at path = {:?}\n\nDefinition at path = {:?}",
                         path,
                         actual_kind.at_path(&path).debug_info(),
                         self.event_kind.at_path(&path).debug_info()
@@ -612,13 +614,13 @@ mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use crate::event::{Event, EventMetadata, LogEvent};
-    use lookup::lookup_v2::parse_target_path;
-    use lookup::owned_value_path;
     use std::collections::{BTreeMap, HashMap};
+
+    use lookup::{lookup_v2::parse_target_path, owned_value_path};
     use vrl::value::Value;
 
     use super::*;
+    use crate::event::{Event, EventMetadata, LogEvent};
 
     #[test]
     fn test_definition_validity() {

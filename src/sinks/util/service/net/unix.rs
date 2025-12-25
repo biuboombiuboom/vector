@@ -1,20 +1,11 @@
-use std::{
-    io,
-    os::fd::{AsFd, BorrowedFd},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use snafu::ResultExt;
-use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixDatagram, UnixStream},
-};
-
+use tokio::net::{UnixDatagram, UnixStream};
 use vector_lib::configurable::configurable_component;
 
-use crate::net;
-
-use super::{net_error::*, ConnectorType, NetError, NetworkConnector};
+use super::{ConnectorType, NetError, NetworkConnector, net_error::*};
+use crate::{net, sinks::util::unix::UnixEither};
 
 /// Unix socket modes.
 #[configurable_component]
@@ -74,29 +65,6 @@ impl UnixConnectorConfig {
     }
 }
 
-pub(super) enum UnixEither {
-    Datagram(UnixDatagram),
-    Stream(UnixStream),
-}
-
-impl UnixEither {
-    pub(super) async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Datagram(datagram) => datagram.send(buf).await,
-            Self::Stream(stream) => stream.write_all(buf).await.map(|_| buf.len()),
-        }
-    }
-}
-
-impl AsFd for UnixEither {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        match self {
-            Self::Datagram(datagram) => datagram.as_fd(),
-            Self::Stream(stream) => stream.as_fd(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct UnixConnector {
     path: PathBuf,
@@ -123,10 +91,10 @@ impl UnixConnector {
                 .map(UnixEither::Stream)?,
         };
 
-        if let Some(send_buffer_size) = self.send_buffer_size {
-            if let Err(error) = net::set_send_buffer_size(&either_socket, send_buffer_size) {
-                warn!(%error, "Failed configuring send buffer size on Unix socket.");
-            }
+        if let Some(send_buffer_size) = self.send_buffer_size
+            && let Err(error) = net::set_send_buffer_size(&either_socket, send_buffer_size)
+        {
+            warn!(%error, "Failed configuring send buffer size on Unix socket.");
         }
 
         Ok((self.path.clone(), either_socket))

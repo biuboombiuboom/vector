@@ -7,9 +7,9 @@ use tower::ServiceBuilder;
 use vector_lib::configurable::configurable_component;
 
 use super::{
-    service::{VectorResponse, VectorService},
-    sink::VectorSink,
     VectorSinkError,
+    service::{VectorRequest, VectorResponse, VectorService},
+    sink::VectorSink,
 };
 use crate::{
     config::{
@@ -19,11 +19,11 @@ use crate::{
     http::build_proxy_connector,
     proto::vector as proto,
     sinks::{
-        util::{
-            retries::RetryLogic, BatchConfig, RealtimeEventBasedDefaultBatchSettings,
-            ServiceBuilderExt, TowerRequestConfig,
-        },
         Healthcheck, VectorSink as VectorSinkType,
+        util::{
+            BatchConfig, RealtimeEventBasedDefaultBatchSettings, ServiceBuilderExt,
+            TowerRequestConfig, retries::RetryLogic,
+        },
     },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
@@ -109,7 +109,7 @@ fn default_config(address: &str) -> VectorConfig {
 #[typetag::serde(name = "vector")]
 impl SinkConfig for VectorConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSinkType, Healthcheck)> {
-        let tls = MaybeTlsSettings::from_config(&self.tls, false)?;
+        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
 
         let client = new_client(&tls, cx.proxy())?;
@@ -220,6 +220,7 @@ struct VectorGrpcRetryLogic;
 
 impl RetryLogic for VectorGrpcRetryLogic {
     type Error = VectorSinkError;
+    type Request = VectorRequest;
     type Response = VectorResponse;
 
     fn is_retriable_error(&self, err: &Self::Error) -> bool {

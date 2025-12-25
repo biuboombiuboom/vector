@@ -2,16 +2,14 @@ use std::net::SocketAddr;
 
 use snafu::ResultExt;
 use tokio::net::TcpStream;
-
-use vector_lib::configurable::configurable_component;
 use vector_lib::{
+    configurable::configurable_component,
     tcp::TcpKeepaliveConfig,
     tls::{MaybeTlsSettings, MaybeTlsStream, TlsEnableableConfig},
 };
 
+use super::{ConnectorType, HostAndPort, NetError, NetworkConnector, net_error::*};
 use crate::dns;
-
-use super::{net_error::*, ConnectorType, HostAndPort, NetError, NetworkConnector};
 
 /// TCP configuration.
 #[configurable_component]
@@ -78,22 +76,23 @@ impl TcpConnector {
 
         let addr = SocketAddr::new(ip, self.address.port);
 
-        let tls = MaybeTlsSettings::from_config(&self.tls, false).context(FailedToConfigureTLS)?;
+        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)
+            .context(FailedToConfigureTLS)?;
         let mut stream = tls
             .connect(self.address.host.as_str(), &addr)
             .await
             .context(FailedToConnectTLS)?;
 
-        if let Some(send_buffer_size) = self.send_buffer_size {
-            if let Err(error) = stream.set_send_buffer_bytes(send_buffer_size) {
-                warn!(%error, "Failed configuring send buffer size on TCP socket.");
-            }
+        if let Some(send_buffer_size) = self.send_buffer_size
+            && let Err(error) = stream.set_send_buffer_bytes(send_buffer_size)
+        {
+            warn!(%error, "Failed configuring send buffer size on TCP socket.");
         }
 
-        if let Some(keepalive) = self.keepalive {
-            if let Err(error) = stream.set_keepalive(keepalive) {
-                warn!(%error, "Failed configuring keepalive on TCP socket.");
-            }
+        if let Some(keepalive) = self.keepalive
+            && let Err(error) = stream.set_keepalive(keepalive)
+        {
+            warn!(%error, "Failed configuring keepalive on TCP socket.");
         }
 
         Ok((addr, stream))
